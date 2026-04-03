@@ -175,6 +175,30 @@ def format_output_pretty(via_map: dict, schema: dict, found_direct: set) -> str:
     return "\n".join(lines)
 
 
+def search_and_format(
+    query: str,
+    schema: dict,
+    *,
+    fuzzy: bool = False,
+    fk: bool = False,
+    depth: int = 1,
+    pretty: bool = False,
+) -> str:
+    found_direct = (
+        search(query, schema) if fuzzy else search_exact_table(query, schema)
+    )
+    if not found_direct:
+        return "Ничего не найдено"
+
+    if fk:
+        via_map = expand_fk(found_direct, schema, depth=depth)
+    else:
+        via_map = {t: set() for t in found_direct}
+
+    formatter = format_output_pretty if pretty else format_output
+    return formatter(via_map, schema, found_direct)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("query", nargs="?",
@@ -191,22 +215,17 @@ def main():
 
     schema = load_schema()
 
-    def run(query):
-        found_direct = (
-            search(query, schema) if args.fuzzy
-            else search_exact_table(query, schema)
+    def run(query: str) -> None:
+        print(
+            search_and_format(
+                query,
+                schema,
+                fuzzy=args.fuzzy,
+                fk=args.fk,
+                depth=args.depth,
+                pretty=args.pretty,
+            )
         )
-        if not found_direct:
-            print("Ничего не найдено")
-            return
-
-        if args.fk:
-            via_map = expand_fk(found_direct, schema, depth=args.depth)
-        else:
-            via_map = {t: set() for t in found_direct}
-
-        formatter = format_output_pretty if args.pretty else format_output
-        print(formatter(via_map, schema, found_direct))
 
     if args.interactive:
         print("Интерактивный режим. 'q' — выход\n")
