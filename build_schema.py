@@ -7,17 +7,15 @@ RAW = Path("raw")
 OUT = Path("output")
 OUT.mkdir(exist_ok=True)
 
+PUBLIC = "public"
+
 # --- Загрузка ---
 cols_df = pd.read_csv(RAW / "columns.csv", sep=";")
 fk_df = pd.read_csv(RAW / "foreign_keys.csv", sep=";")
 
-# --- PK определяем по column_default (nextval = serial = PK) ---
-
 
 def is_pk(default):
     return str(default).startswith("nextval")
-
-# --- Короткий тип ---
 
 
 def short_type(data_type, max_len):
@@ -36,28 +34,39 @@ def short_type(data_type, max_len):
     }
     if data_type == "character varying":
         if pd.notna(max_len):
-            # убираем пробелы и конвертируем в int
-            max_len_int = int(str(max_len).replace(
-                "\xa0", "").replace(" ", ""))
+            max_len_int = int(str(max_len).replace("\xa0", "").replace(" ", ""))
             return f"varchar({max_len_int})"
         else:
             return "varchar"
     return m.get(data_type, data_type)
 
 
+def qualified(schema: str, table: str) -> str:
+    """Returns table for public schema, schema.table for others."""
+    return table if schema == PUBLIC else f"{schema}.{table}"
+
+
 # --- FK индекс ---
-fk_index = {}  # (from_table, from_col) -> "to_table.to_col"
-fk_in = {}  # to_table -> ["from_table.from_col", ...]
+# ключ: (from_schema, from_table, from_col)
+# значение: "[schema.]to_table.to_col"  (schema опускается для public)
+fk_index: dict[tuple, str] = {}
+fk_in: dict[str, list[str]] = {}  # qualified_to → [qualified_from, ...]
 
 for _, row in fk_df.iterrows():
-    fk_index[(row["from_table"], row["from_col"])
-             ] = f"{row['to_table']}.{row['to_col']}"
-    fk_in.setdefault(row["to_table"], []).append(row["from_table"])
+    from_key = (row["from_schema"], row["from_table"], row["from_col"])
+    to_q = qualified(row["to_schema"], row["to_table"])
+    fk_index[from_key] = f"{to_q}.{row['to_col']}"
+
+    from_q = qualified(row["from_schema"], row["from_table"])
+    fk_in.setdefault(to_q, []).append(from_q)
 
 # --- Строим схему ---
 schema = []
 
-for table_name, group in cols_df.groupby("table_name", sort=True):
+for (table_schema, table_name), group in cols_df.groupby(
+    ["table_schema", "table_name"], sort=True
+):
+    q_key = qualified(table_schema, table_name)
     columns = []
     col_names = []
 
@@ -68,8 +77,9 @@ for table_name, group in cols_df.groupby("table_name", sort=True):
 
         if is_pk(row["column_default"]):
             flags.append("PK")
-        if (table_name, col) in fk_index:
-            flags.append(f"FK→{fk_index[(table_name, col)]}")
+        fk_ref = fk_index.get((table_schema, table_name, col))
+        if fk_ref:
+            flags.append(f"FK→{fk_ref}")
         if row["is_nullable"] == "NO" and not is_pk(row["column_default"]):
             flags.append("NOT NULL")
 
@@ -79,20 +89,21 @@ for table_name, group in cols_df.groupby("table_name", sort=True):
 
     fk_out_list = [
         f"{col}→{ref}"
-        for (t, col), ref in fk_index.items()
-        if t == table_name
+        for (s, t, col), ref in fk_index.items()
+        if s == table_schema and t == table_name
     ]
-    fk_in_list = fk_in.get(table_name, [])
+    fk_in_list = fk_in.get(q_key, [])
 
-    # Компактная строка для контекста
-    text = f"{table_name}({', '.join(columns)})"
+    text = f"{q_key}({', '.join(columns)})"
 
     schema.append({
-        "table":    table_name,
-        "text":     text,
-        "columns":  col_names,
-        "fk_out":   fk_out_list,
-        "fk_in":    fk_in_list,
+        "schema": table_schema,
+        "table":  q_key,        # qualified key — используется как ключ словаря
+        "name":   table_name,   # короткое имя без схемы
+        "text":   text,
+        "columns": col_names,
+        "fk_out": fk_out_list,
+        "fk_in":  fk_in_list,
     })
 
 # --- Сохраняем ---

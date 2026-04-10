@@ -2,6 +2,7 @@
 python search_schema.py "payment client"
 python search_schema.py "remont" --fk
 python search_schema.py "remont payment client" --fk --depth 2
+python search_schema.py "orders" --schema sale --fk
 """
 
 import argparse
@@ -11,34 +12,50 @@ from pathlib import Path
 SCHEMA_PATH = Path("output/schema_compact.json")
 
 
-def load_schema():
+def load_schema() -> dict:
     with open(SCHEMA_PATH, encoding="utf-8") as f:
         data = json.load(f)
+    # ключ — qualified name: "table" для public, "schema.table" для остальных
     return {item["table"]: item for item in data}
 
 
-def search(query: str, schema: dict) -> set:
+def _schema_names(schema: dict) -> list[str]:
+    """Список уникальных схем, отсортированных (public первая)."""
+    schemas = sorted({item["schema"] for item in schema.values()})
+    if "public" in schemas:
+        schemas.remove("public")
+        schemas.insert(0, "public")
+    return schemas
+
+
+def search(query: str, schema: dict, schema_filter: str | None = None) -> set:
     keywords = query.lower().split()
     found = set()
-    for table_name, item in schema.items():
-        if any(kw in table_name.lower() for kw in keywords):
-            found.add(table_name)
+    for table_key, item in schema.items():
+        if schema_filter and item.get("schema") != schema_filter:
+            continue
+        name = item.get("name", table_key)
+        if any(kw in name.lower() for kw in keywords):
+            found.add(table_key)
             continue
         if any(any(kw in col.lower() for kw in keywords) for col in item["columns"]):
-            found.add(table_name)
+            found.add(table_key)
     return found
 
 
-def search_exact_table(query: str, schema: dict) -> set:
+def search_exact_table(
+    query: str, schema: dict, schema_filter: str | None = None
+) -> set:
     q = query.strip()
     if not q:
         return set()
-    if q in schema:
-        return {q}
     q_lower = q.lower()
-    for table_name in schema:
-        if table_name.lower() == q_lower:
-            return {table_name}
+    for table_key, item in schema.items():
+        if schema_filter and item.get("schema") != schema_filter:
+            continue
+        name = item.get("name", table_key)
+        if table_key == q or name == q or table_key.lower() == q_lower or name.lower() == q_lower:
+            return {table_key}
     return set()
 
 
@@ -48,14 +65,15 @@ def expand_fk(tables: set, schema: dict, depth: int) -> dict:
 
     for _ in range(depth):
         to_add: dict[str, set] = {}
-        for table_name in current:
-            item = schema.get(table_name, {})
-            # только fk_out раскрываем как дерево
+        for table_key in current:
+            item = schema.get(table_key, {})
             for fk in item.get("fk_out", []):
-                ref = fk.split("→")[1].split(".")[0]
+                # формат: "col→[schema.]to_table.to_col"
+                # берём часть после →, отрезаем последний сегмент (.to_col)
+                ref_full = fk.split("→")[1]          # "[schema.]to_table.to_col"
+                ref = ref_full.rsplit(".", 1)[0]      # "[schema.]to_table"
                 if ref not in via_map:
-                    to_add.setdefault(ref, set()).add(table_name)
-            # fk_in больше не раскрываем
+                    to_add.setdefault(ref, set()).add(table_key)
 
         for t, parents in to_add.items():
             via_map[t] = parents
@@ -119,10 +137,10 @@ def format_output_pretty(via_map: dict, schema: dict, found_direct: set) -> str:
 
     lines.append("=" * 80)
     lines.append(
-        f"RESULTS | tables: {len(all_tables)} | direct: {direct_count} | via_fk: {via_fk_count}")
+        f"RESULTS | tables: {len(all_tables)} | direct: {direct_count} | via_fk: {via_fk_count}"
+    )
     lines.append("=" * 80)
 
-    # parent -> [children]
     children: dict[str, list] = {}
     for table_name in all_tables - found_direct:
         for p in via_map.get(table_name, set()):
@@ -131,21 +149,15 @@ def format_output_pretty(via_map: dict, schema: dict, found_direct: set) -> str:
     def print_table(table_name: str, indent: str, has_children: bool):
         item = schema.get(table_name)
         if not item:
+            # таблица из другой схемы, может не быть в словаре (edge case)
+            lines.append(f"{indent}┌─ {table_name}  [external]")
             return
 
         cols = parse_columns(item.get("text", ""))
-        # fk_in = item.get("fk_in", [])
-
         lines.append(f"{indent}┌─ {table_name}")
         for i, col in enumerate(cols):
             branch = "└── " if i == len(cols) - 1 else "├── "
-            # and not fk_in else "├── "
             lines.append(f"{indent}│   {branch}{col}")
-
-        # if fk_in:
-        #     lines.append(f"{indent}│   │")
-        #     lines.append(
-        #         f"{indent}│   └── referenced by: {', '.join(sorted(fk_in))}")
 
         if has_children:
             lines.append(f"{indent}│")
@@ -156,7 +168,6 @@ def format_output_pretty(via_map: dict, schema: dict, found_direct: set) -> str:
         visited.add(table_name)
 
         kids = sorted(children.get(table_name, []))
-        # <-- передаём флаг
         print_table(table_name, indent, has_children=bool(kids))
 
         for child in kids:
@@ -183,9 +194,12 @@ def search_and_format(
     fk: bool = False,
     depth: int = 1,
     pretty: bool = False,
+    schema_filter: str | None = "public",
 ) -> str:
     found_direct = (
-        search(query, schema) if fuzzy else search_exact_table(query, schema)
+        search(query, schema, schema_filter)
+        if fuzzy
+        else search_exact_table(query, schema, schema_filter)
     )
     if not found_direct:
         return "Ничего не найдено"
@@ -201,18 +215,20 @@ def search_and_format(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("query", nargs="?",
-                        help="Имя таблицы (по умолчанию точный поиск)")
-    parser.add_argument("--fk",    action="store_true", help="Расширить по FK")
-    parser.add_argument("--fuzzy", action="store_true",
-                        help="Поиск по подстрокам в именах таблиц и колонок")
-    parser.add_argument("--depth", type=int, default=1,
-                        help="Глубина FK (default: 1)")
-    parser.add_argument("--pretty", action="store_true",
-                        help="Читаемый формат вывода")
+    parser.add_argument("query", nargs="?", help="Имя таблицы (по умолчанию точный поиск)")
+    parser.add_argument("--fk",     action="store_true", help="Расширить по FK")
+    parser.add_argument("--fuzzy",  action="store_true", help="Поиск по подстрокам")
+    parser.add_argument("--depth",  type=int, default=1, help="Глубина FK (default: 1)")
+    parser.add_argument("--pretty", action="store_true", help="Читаемый формат вывода")
+    parser.add_argument(
+        "--schema",
+        default="public",
+        help="Схема для поиска (default: public). Используй 'all' для поиска везде",
+    )
     parser.add_argument("--interactive", "-i", action="store_true")
     args = parser.parse_args()
 
+    schema_filter = None if args.schema == "all" else args.schema
     schema = load_schema()
 
     def run(query: str) -> None:
@@ -224,11 +240,12 @@ def main():
                 fk=args.fk,
                 depth=args.depth,
                 pretty=args.pretty,
+                schema_filter=schema_filter,
             )
         )
 
     if args.interactive:
-        print("Интерактивный режим. 'q' — выход\n")
+        print(f"Интерактивный режим. Схема: {args.schema}. 'q' — выход\n")
         while True:
             try:
                 line = input("Поиск> ").strip()
