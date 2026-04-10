@@ -1,2 +1,4 @@
 streamlit>=1.40,<2
 pandas
+psycopg[binary]
+python-dotenv
