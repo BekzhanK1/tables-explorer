@@ -12,6 +12,53 @@ from psycopg.rows import dict_row
 MIN_QUERY_LEN = 6
 DEFAULT_LIMIT = 200
 
+# Один источник правды для fetch и для предпросмотра на фронте.
+FUNCTIONS_SEARCH_SQL = """
+SELECT DISTINCT ON (t.schema_name, t.function_name)
+       t.version_id,
+       t.function_name,
+       t.schema_name,
+       t.source_code,
+       t.rowversion,
+       t.employee_id,
+       t.pg_user,
+       t.is_from_compare
+FROM version_tab t
+WHERE t.function_name ILIKE %(query)s
+   OR t.source_code ILIKE %(query)s
+ORDER BY t.schema_name, t.function_name, t.rowversion DESC
+LIMIT %(limit)s;
+"""
+
+
+def functions_search_sql_preview(query: str, limit: int = DEFAULT_LIMIT) -> str:
+    """
+    Текст запроса для UI (копипаст в psql).
+    Параметры подставлены как литералы; апострофы в шаблоне экранированы.
+    Реальное выполнение в fetch_functions по-прежнему через bind-параметры.
+    """
+    clean = query.strip()
+    pattern = f"%{clean}%"
+    lit = pattern.replace("'", "''")
+    lim = int(limit)
+    return (
+        "-- ILIKE pattern (same as bound %(query)s in app)\n"
+        f"SELECT DISTINCT ON (t.schema_name, t.function_name)\n"
+        f"       t.version_id,\n"
+        f"       t.function_name,\n"
+        f"       t.schema_name,\n"
+        f"       t.source_code,\n"
+        f"       t.rowversion,\n"
+        f"       t.employee_id,\n"
+        f"       t.pg_user,\n"
+        f"       t.is_from_compare\n"
+        f"FROM version_tab t\n"
+        f"WHERE t.function_name ILIKE '{lit}'\n"
+        f"   OR t.source_code ILIKE '{lit}'\n"
+        f"ORDER BY t.schema_name, t.function_name, t.rowversion DESC\n"
+        f"LIMIT {lim};"
+    )
+
 
 @dataclass(frozen=True)
 class FunctionRecord:
@@ -61,22 +108,7 @@ def fetch_functions(query: str, limit: int = DEFAULT_LIMIT) -> list[FunctionReco
     if len(clean_query) < MIN_QUERY_LEN:
         raise ValueError(f"Search query must be at least {MIN_QUERY_LEN} characters")
 
-    sql = """
-        SELECT DISTINCT ON (t.schema_name, t.function_name)
-               t.version_id,
-               t.function_name,
-               t.schema_name,
-               t.source_code,
-               t.rowversion,
-               t.employee_id,
-               t.pg_user,
-               t.is_from_compare
-        FROM version_tab t
-        WHERE t.function_name ILIKE %(query)s
-           OR t.source_code ILIKE %(query)s
-        ORDER BY t.schema_name, t.function_name, t.rowversion DESC
-        LIMIT %(limit)s;
-    """
+    sql = FUNCTIONS_SEARCH_SQL
 
     params = {
         "query": f"%{clean_query}%",

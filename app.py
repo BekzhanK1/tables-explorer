@@ -4,8 +4,18 @@ import html
 import re
 
 import streamlit as st
+import streamlit.components.v1 as components
+from pygments import highlight as pyg_highlight
+from pygments.formatters import HtmlFormatter
+from pygments.lexers import get_lexer_by_name
 
-from db_functions import DEFAULT_LIMIT, MIN_QUERY_LEN, FunctionRecord, fetch_functions
+from db_functions import (
+    DEFAULT_LIMIT,
+    MIN_QUERY_LEN,
+    FunctionRecord,
+    fetch_functions,
+    functions_search_sql_preview,
+)
 from search_schema import _schema_names, load_schema, search_and_format
 
 
@@ -14,30 +24,65 @@ def cached_schema() -> dict:
     return load_schema()
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def cached_fetch_functions(query: str, limit: int) -> list[FunctionRecord]:
     return fetch_functions(query, limit)
 
 
-def highlight_code(code: str, query: str) -> str:
-    pattern = re.compile(re.escape(query.strip()), re.IGNORECASE)
-    parts: list[str] = []
-    last = 0
+def _lexer_plpgsql():
+    try:
+        return get_lexer_by_name("plpgsql")
+    except Exception:
+        return get_lexer_by_name("postgresql")
 
-    for match in pattern.finditer(code):
-        parts.append(html.escape(code[last:match.start()]))
-        parts.append(f"<mark>{html.escape(match.group(0))}</mark>")
-        last = match.end()
 
-    parts.append(html.escape(code[last:]))
-    highlighted = "".join(parts)
+def render_code(code: str, query: str) -> None:
+    # noclasses + monokai: inline styles, без внешнего CSS — стабильнее в iframe
+    formatter = HtmlFormatter(style="monokai", nowrap=False, noclasses=True)
+    lexer = _lexer_plpgsql()
 
-    return (
-        "<pre style='white-space: pre-wrap; overflow-x: auto; "
-        "padding: 1rem; border: 1px solid rgba(128,128,128,0.3); "
-        "border-radius: 0.5rem;'>"
-        f"{highlighted}</pre>"
+    code_html = pyg_highlight(code, lexer, formatter)
+
+    clean_q = query.strip()
+    if clean_q:
+        escaped_q = html.escape(clean_q)
+        pattern = re.compile(re.escape(escaped_q), re.IGNORECASE)
+        code_html = pattern.sub(
+            lambda m: (
+                "<mark style='background:#ffe066;color:#1a1a1a;"
+                "border-radius:2px;padding:0 2px'>"
+                f"{m.group(0)}</mark>"
+            ),
+            code_html,
+        )
+
+    # st.markdown в @st.dialog ломает вложенный HTML (<span> внутри <pre>);
+    # components.html рендерит сырой HTML в iframe.
+    full_page = (
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<style>"
+        "body{margin:0;background:#272822;color:#f8f8f2;font-size:16px;"
+        "font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;}"
+        ".highlight{border-radius:.5rem;overflow:hidden;font-size:16px;}"
+        ".highlight pre span{font-size:inherit!important;}"
+        ".highlight pre{margin:0;padding:1rem;font-size:16px;line-height:1.6;"
+        "white-space:pre-wrap;word-break:break-word;overflow-x:auto;}"
+        "</style></head><body>"
+        f"{code_html}"
+        "</body></html>"
     )
+    components.html(full_page, height=560, scrolling=True)
+
+
+@st.dialog("Source code", width="large")
+def show_code_modal(record: FunctionRecord, query: str) -> None:
+    st.caption(
+        f"`{record.schema_name}.{record.function_name}`"
+        f"  ·  v{record.version_id}"
+        f"  ·  {record.pg_user or '—'}"
+        f"  ·  {record.rowversion or '—'}"
+    )
+    render_code(record.source_code, query)
 
 
 def render_tables_tab(schema: dict, schemas: list[str]) -> None:
@@ -68,92 +113,81 @@ def render_tables_tab(schema: dict, schemas: list[str]) -> None:
         return
 
     result = search_and_format(
-        q,
-        schema,
-        fuzzy=fuzzy,
-        fk=fk,
-        depth=int(depth),
-        pretty=pretty,
+        q, schema, fuzzy=fuzzy, fk=fk, depth=int(depth), pretty=pretty,
         schema_filter=schema_filter,
     )
     st.code(result, language=None)
 
 
 def render_functions_tab() -> None:
-    st.caption(
-        f"Поиск по `version_tab` в PostgreSQL. Минимальная длина запроса: {MIN_QUERY_LEN} символов."
-    )
-
     with st.form("functions_search_form"):
-        query = st.text_input(
-            "Имя функции или текст в исходнике",
+        query_input = st.text_input(
+            "",
             value=st.session_state.get("functions_query", ""),
-            placeholder="remont_contragent_get_ostatok_sum",
+            placeholder=f"Function name or code fragment (min {MIN_QUERY_LEN} chars)",
         )
-        submitted = st.form_submit_button("Search functions")
+        submitted = st.form_submit_button("Search", use_container_width=True)
 
     if submitted:
-        clean_query = query.strip()
+        clean_query = query_input.strip()
         st.session_state["functions_query"] = clean_query
+        st.session_state["functions_error"] = ""
 
         if len(clean_query) < MIN_QUERY_LEN:
             st.session_state["functions_results"] = []
             st.session_state["functions_error"] = (
-                f"Введите минимум {MIN_QUERY_LEN} символов."
+                f"Enter at least {MIN_QUERY_LEN} characters."
             )
         else:
-            try:
-                records = cached_fetch_functions(clean_query, DEFAULT_LIMIT)
-            except Exception as exc:
-                st.session_state["functions_results"] = []
-                st.session_state["functions_error"] = str(exc)
-            else:
-                st.session_state["functions_results"] = records
-                st.session_state["functions_error"] = ""
+            with st.spinner("Searching..."):
+                try:
+                    records = cached_fetch_functions(clean_query, DEFAULT_LIMIT)
+                    st.session_state["functions_results"] = records
+                except Exception as exc:
+                    st.session_state["functions_results"] = []
+                    st.session_state["functions_error"] = str(exc)
+
+    preview_q = st.session_state.get("functions_query", "").strip()
+    if len(preview_q) >= MIN_QUERY_LEN:
+        with st.expander("SQL query", expanded=False):
+            st.caption(
+                "Тот же запрос, что уходит в БД (ниже — литералы для копипаста в psql; "
+                "в коде используются bind-параметры)."
+            )
+            st.code(
+                functions_search_sql_preview(preview_q, DEFAULT_LIMIT),
+                language="sql",
+            )
 
     error_message = st.session_state.get("functions_error", "")
     if error_message:
         st.warning(error_message)
+        return
 
     records: list[FunctionRecord] = st.session_state.get("functions_results", [])
     current_query = st.session_state.get("functions_query", "")
-    if not records:
+
+    if "functions_results" not in st.session_state:
         return
 
-    st.write(f"Найдено функций: {len(records)}")
-    if len(records) >= DEFAULT_LIMIT:
-        st.info(f"Показаны первые {DEFAULT_LIMIT} результатов.")
+    if not records:
+        if current_query:
+            st.caption("No functions found.")
+        return
 
-    selected_label = st.selectbox(
-        "Открыть функцию",
-        options=[record.qualified_name for record in records],
-        key="selected_function_label",
-    )
-    selected_record = next(
-        record for record in records if record.qualified_name == selected_label
-    )
+    n = len(records)
+    suffix = f" · showing first {DEFAULT_LIMIT}" if n >= DEFAULT_LIMIT else ""
+    st.caption(f"{n} function{'s' if n != 1 else ''} found{suffix}")
+    st.divider()
 
-    meta1, meta2, meta3, meta4 = st.columns(4)
-    meta1.metric("Schema", selected_record.schema_name)
-    meta2.metric("Function", selected_record.function_name)
-    meta3.metric("Version ID", str(selected_record.version_id))
-    meta4.metric("User", selected_record.pg_user or "-")
-
-    rowversion = selected_record.rowversion or "-"
-    employee_id = (
-        str(selected_record.employee_id)
-        if selected_record.employee_id is not None
-        else "-"
-    )
-    compare_flag = (
-        "yes" if selected_record.is_from_compare else "no"
-        if selected_record.is_from_compare is not None
-        else "-"
-    )
-    st.caption(
-        f"rowversion: {rowversion} | employee_id: {employee_id} | is_from_compare: {compare_flag}"
-    )
-    st.markdown(highlight_code(selected_record.source_code, current_query), unsafe_allow_html=True)
+    for record in records:
+        col_name, col_meta, col_btn = st.columns([5, 3, 1])
+        col_name.markdown(f"**{record.function_name}**")
+        col_meta.caption(
+            f"{record.schema_name}  ·  {record.pg_user or '—'}  ·  {record.rowversion or '—'}"
+        )
+        if col_btn.button("View", key=f"view_{record.version_id}"):
+            show_code_modal(record, current_query)
 
 
 def main() -> None:
