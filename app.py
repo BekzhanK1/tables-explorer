@@ -13,8 +13,13 @@ from db_functions import (
     DEFAULT_LIMIT,
     MIN_QUERY_LEN,
     FunctionRecord,
+    FunctionVersion,
     fetch_functions,
     functions_search_sql_preview,
+    extract_tables_from_function,
+    fetch_function_timeline,
+    compute_diff,
+    compute_diff_stats,
 )
 from search_schema import _schema_names, load_schema, search_and_format
 
@@ -27,6 +32,11 @@ def cached_schema() -> dict:
 @st.cache_data(ttl=300, show_spinner=False)
 def cached_fetch_functions(query: str, limit: int) -> list[FunctionRecord]:
     return fetch_functions(query, limit)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_fetch_timeline(function_name: str, schema_name: str | None, source_db_filter: str | None) -> list[FunctionVersion]:
+    return fetch_function_timeline(function_name, schema_name, source_db_filter)
 
 
 def _lexer_plpgsql():
@@ -190,19 +200,474 @@ def render_functions_tab() -> None:
             show_code_modal(record, current_query)
 
 
+def render_diff_colored(diff_text: str) -> None:
+    """Отображает diff с цветовым кодированием"""
+    if not diff_text:
+        st.info("Нет изменений")
+        return
+    
+    lines = diff_text.split('\n')
+    html_lines = []
+    
+    html_lines.append('<div style="font-family:monospace;font-size:14px;line-height:1.5;background:#1e1e1e;padding:1rem;border-radius:0.5rem;overflow-x:auto;">')
+    
+    for line in lines:
+        escaped_line = html.escape(line)
+        if line.startswith('+') and not line.startswith('+++'):
+            html_lines.append(f'<div style="background:#1a4d1a;color:#7dff7d;padding:2px 4px;">{escaped_line}</div>')
+        elif line.startswith('-') and not line.startswith('---'):
+            html_lines.append(f'<div style="background:#4d1a1a;color:#ff7d7d;padding:2px 4px;">{escaped_line}</div>')
+        elif line.startswith('@@'):
+            html_lines.append(f'<div style="background:#1a3a4d;color:#7dc8ff;padding:2px 4px;font-weight:bold;">{escaped_line}</div>')
+        elif line.startswith('---') or line.startswith('+++'):
+            html_lines.append(f'<div style="color:#888;padding:2px 4px;">{escaped_line}</div>')
+        else:
+            html_lines.append(f'<div style="color:#d4d4d4;padding:2px 4px;">{escaped_line}</div>')
+    
+    html_lines.append('</div>')
+    st.markdown(''.join(html_lines), unsafe_allow_html=True)
+
+
+def render_code_simple(code: str) -> None:
+    """Простое отображение кода с подсветкой синтаксиса для timeline"""
+    if not code:
+        st.warning("Код недоступен")
+        return
+    
+    # Используем st.code вместо components.html для совместимости с expander
+    st.code(code, language="sql", line_numbers=True)
+
+
+def render_code_with_changes(current_code: str, previous_code: str) -> None:
+    """Отображает полный код с подсветкой изменений, включая удалённые строки"""
+    import difflib
+    
+    if not current_code:
+        st.warning("Код недоступен")
+        return
+    
+    # Разбиваем код на строки
+    current_lines = current_code.splitlines()
+    previous_lines = previous_code.splitlines() if previous_code else []
+    
+    # Используем SequenceMatcher для определения изменений
+    matcher = difflib.SequenceMatcher(None, previous_lines, current_lines)
+    
+    # Создаём объединённое представление с информацией об изменениях
+    display_lines = []
+    current_line_num = 1
+    
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'equal':
+            # Строки без изменений
+            for i in range(j1, j2):
+                display_lines.append({
+                    'line_num': current_line_num,
+                    'content': current_lines[i],
+                    'type': 'equal'
+                })
+                current_line_num += 1
+                
+        elif tag == 'replace':
+            # Строки были изменены - показываем удалённые и добавленные
+            # Сначала удалённые (красным)
+            for i in range(i1, i2):
+                display_lines.append({
+                    'line_num': '—',
+                    'content': previous_lines[i],
+                    'type': 'deleted'
+                })
+            # Потом добавленные (зелёным)
+            for i in range(j1, j2):
+                display_lines.append({
+                    'line_num': current_line_num,
+                    'content': current_lines[i],
+                    'type': 'added'
+                })
+                current_line_num += 1
+                
+        elif tag == 'delete':
+            # Строки были удалены
+            for i in range(i1, i2):
+                display_lines.append({
+                    'line_num': '—',
+                    'content': previous_lines[i],
+                    'type': 'deleted'
+                })
+                
+        elif tag == 'insert':
+            # Строки были добавлены
+            for i in range(j1, j2):
+                display_lines.append({
+                    'line_num': current_line_num,
+                    'content': current_lines[i],
+                    'type': 'added'
+                })
+                current_line_num += 1
+    
+    # Формируем HTML с подсветкой
+    html_lines = []
+    html_lines.append('<div style="font-family:monospace;font-size:14px;line-height:1.6;background:#1e1e1e;padding:1rem;border-radius:0.5rem;overflow-x:auto;max-height:600px;overflow-y:auto;">')
+    
+    for line_info in display_lines:
+        escaped_line = html.escape(line_info['content'])
+        line_num = line_info['line_num']
+        line_type = line_info['type']
+        
+        if line_type == 'added':
+            # Добавленная строка - зелёный фон
+            html_lines.append(
+                f'<div style="background:#1a4d1a;color:#7dff7d;padding:2px 8px;border-left:3px solid #4ade80;">'
+                f'<span style="color:#888;margin-right:1em;user-select:none;display:inline-block;width:3em;text-align:right;">{line_num}</span>'
+                f'<span style="color:#4ade80;margin-right:0.5em;">+</span>'
+                f'{escaped_line}</div>'
+            )
+        elif line_type == 'deleted':
+            # Удалённая строка - красный фон
+            html_lines.append(
+                f'<div style="background:#4d1a1a;color:#ff7d7d;padding:2px 8px;border-left:3px solid #f87171;">'
+                f'<span style="color:#888;margin-right:1em;user-select:none;display:inline-block;width:3em;text-align:right;">{line_num}</span>'
+                f'<span style="color:#f87171;margin-right:0.5em;">−</span>'
+                f'{escaped_line}</div>'
+            )
+        else:
+            # Обычная строка
+            html_lines.append(
+                f'<div style="color:#d4d4d4;padding:2px 8px;">'
+                f'<span style="color:#888;margin-right:1em;user-select:none;display:inline-block;width:3em;text-align:right;">{line_num}</span>'
+                f'<span style="margin-right:0.5em;opacity:0;"> </span>'
+                f'{escaped_line}</div>'
+            )
+    
+    html_lines.append('</div>')
+    
+    # Добавляем легенду
+    st.caption("🟢 Зелёным выделены добавленные строки · 🔴 Красным выделены удалённые строки")
+    st.markdown(''.join(html_lines), unsafe_allow_html=True)
+
+
+def render_function_timeline_tab() -> None:
+    """Вкладка для просмотра истории изменений функции"""
+    st.markdown("### 📜 История изменений функции")
+    st.caption("Просмотр всех версий функции с визуализацией изменений")
+    
+    # Получаем список доступных баз данных
+    from db_functions import _discover_databases
+    available_dbs = _discover_databases()
+    db_options = ["all"] + [db["name"] for db in available_dbs]
+    
+    with st.form("timeline_search_form"):
+        col1, col2, col3 = st.columns([3, 1, 1])
+        
+        with col1:
+            function_name = st.text_input(
+                "Название функции",
+                value=st.session_state.get("timeline_function_name", ""),
+                placeholder="Введите точное название функции",
+            )
+        
+        with col2:
+            schema_name = st.text_input(
+                "Схема (опционально)",
+                value=st.session_state.get("timeline_schema_name", ""),
+                placeholder="public",
+            )
+        
+        with col3:
+            source_db_filter = st.selectbox(
+                "База данных",
+                options=db_options,
+                index=0,
+                key="timeline_db_filter_select"
+            )
+        
+        submitted = st.form_submit_button("Показать историю", use_container_width=True)
+    
+    if submitted:
+        clean_name = function_name.strip()
+        clean_schema = schema_name.strip() if schema_name.strip() else None
+        db_filter = source_db_filter if source_db_filter != "all" else None
+        
+        st.session_state["timeline_function_name"] = clean_name
+        st.session_state["timeline_schema_name"] = clean_schema or ""
+        st.session_state["timeline_db_filter"] = db_filter
+        st.session_state["timeline_error"] = ""
+        st.session_state["timeline_results"] = []
+        
+        if not clean_name:
+            st.session_state["timeline_error"] = "Введите название функции."
+        else:
+            with st.spinner("Загрузка истории..."):
+                try:
+                    versions = cached_fetch_timeline(clean_name, clean_schema, db_filter)
+                    st.session_state["timeline_results"] = versions
+                    if not versions:
+                        st.session_state["timeline_error"] = f"Функция '{clean_name}' не найдена."
+                except Exception as exc:
+                    st.session_state["timeline_results"] = []
+                    st.session_state["timeline_error"] = f"Ошибка: {str(exc)}"
+    
+    error_message = st.session_state.get("timeline_error", "")
+    if error_message:
+        st.warning(error_message)
+        return
+    
+    versions: list[FunctionVersion] = st.session_state.get("timeline_results", [])
+    
+    if "timeline_results" not in st.session_state:
+        return
+    
+    if not versions:
+        return
+    
+    st.success(f"Найдено версий: {len(versions)}")
+    
+    # Предупреждение при поиске по всем базам
+    if not st.session_state.get("timeline_db_filter"):
+        # Проверяем, есть ли версии из разных баз
+        all_sources = set()
+        for v in versions:
+            if v.source_dbs:
+                all_sources.update(v.source_dbs)
+            elif v.source_db:
+                all_sources.add(v.source_db)
+        
+        if len(all_sources) > 1:
+            st.warning(
+                "⚠️ **Внимание:** Поиск выполнен по всем базам данных. "
+                "Сравнение версий из разных баз может быть некорректным. "
+                "Для точного сравнения выберите конкретную базу данных в форме поиска."
+            )
+    
+    # Фильтр по источнику данных (только если не выбрана конкретная база)
+    if versions and not st.session_state.get("timeline_db_filter"):
+        # Собираем все уникальные источники
+        all_sources = set()
+        for v in versions:
+            if v.source_dbs:
+                all_sources.update(v.source_dbs)
+            elif v.source_db:
+                all_sources.add(v.source_db)
+        
+        sources = sorted(all_sources)
+        
+        if len(sources) > 1:
+            st.caption("Фильтр по источнику данных:")
+            selected_sources = st.multiselect(
+                "Выберите базы данных:",
+                options=sources,
+                default=sources,
+                key="timeline_source_filter"
+            )
+            
+            if selected_sources:
+                # Фильтруем версии
+                filtered_versions = []
+                for v in versions:
+                    if v.source_dbs:
+                        # Проверяем, есть ли хотя бы один источник в выбранных
+                        if any(src in selected_sources for src in v.source_dbs):
+                            filtered_versions.append(v)
+                    elif v.source_db and v.source_db in selected_sources:
+                        filtered_versions.append(v)
+                
+                versions = filtered_versions
+                st.info(f"Отфильтровано версий: {len(versions)}")
+    
+    st.divider()
+    
+    # Отображаем версии от новых к старым
+    for idx, version in enumerate(versions):
+        is_first = (idx == len(versions) - 1)
+        version_num = len(versions) - idx
+        
+        # Формируем заголовок expander с источником данных
+        if version.source_dbs:
+            # Множественные источники
+            source_label = f"[{', '.join(version.source_dbs)}]"
+        elif version.source_db:
+            # Один источник
+            source_label = f"[{version.source_db}]"
+        else:
+            source_label = ""
+        
+        if is_first:
+            title = f"Версия #{version_num} (первая версия) {source_label} · 📅 {version.rowversion or '—'} · 👤 {version.pg_user or '—'}"
+        elif idx == 0:
+            title = f"Версия #{version_num} (текущая) {source_label} · 📅 {version.rowversion or '—'} · 👤 {version.pg_user or '—'}"
+        else:
+            title = f"Версия #{version_num} {source_label} · 📅 {version.rowversion or '—'} · 👤 {version.pg_user or '—'}"
+        
+        with st.expander(title, expanded=False):
+            # Метаданные
+            col1, col2, col3, col4 = st.columns(4)
+            col1.caption(f"**Schema:** {version.schema_name}")
+            col2.caption(f"**Version ID:** {version.version_id}")
+            col3.caption(f"**Employee ID:** {version.employee_id or '—'}")
+            
+            # Отображаем источники
+            if version.source_dbs:
+                sources_str = ", ".join(version.source_dbs)
+                col4.caption(f"**Sources:** {sources_str}")
+            else:
+                col4.caption(f"**Source DB:** {version.source_db or 'main'}")
+            
+            st.divider()
+            
+            if is_first:
+                # Первая версия - только показываем код
+                st.info("🎉 Создание функции")
+                
+                # Используем radio для переключения вместо кнопок
+                view_mode = st.radio(
+                    "Выберите режим просмотра:",
+                    ["Скрыть", "Показать код"],
+                    key=f"view_mode_first_{version.version_id}",
+                    horizontal=True
+                )
+                
+                if view_mode == "Показать код":
+                    render_code_simple(version.source_code)
+            else:
+                # Не первая версия - показываем diff и статистику
+                prev_version = versions[idx + 1]
+                
+                # Проверяем, из разных ли баз данных эти версии
+                current_sources = set(version.source_dbs) if version.source_dbs else {version.source_db}
+                prev_sources = set(prev_version.source_dbs) if prev_version.source_dbs else {prev_version.source_db}
+                
+                # Если версии из разных баз - показываем предупреждение
+                different_sources = current_sources != prev_sources
+                if different_sources and not st.session_state.get("timeline_db_filter"):
+                    st.error(
+                        "⚠️ **ВНИМАНИЕ:** Сравнение версий из разных баз данных может быть некорректным! "
+                        f"Текущая версия из: {', '.join(sorted(current_sources))} | "
+                        f"Предыдущая версия из: {', '.join(sorted(prev_sources))}"
+                    )
+                
+                # Вычисляем статистику
+                added, removed = compute_diff_stats(prev_version.source_code, version.source_code)
+                
+                if added > 0 or removed > 0:
+                    st.markdown(f"**Изменения:** ➕ {added} строк, ➖ {removed} строк")
+                else:
+                    st.info("Нет изменений в коде")
+                
+                # Используем radio для переключения между режимами
+                view_mode = st.radio(
+                    "Выберите режим просмотра:",
+                    ["Скрыть", "Показать diff", "Показать полный код"],
+                    key=f"view_mode_{version.version_id}",
+                    horizontal=True
+                )
+                
+                # Показываем diff
+                if view_mode == "Показать diff":
+                    diff_text = compute_diff(prev_version.source_code, version.source_code)
+                    if diff_text:
+                        render_diff_colored(diff_text)
+                    else:
+                        st.info("Нет изменений")
+                
+                # Показываем полный код
+                elif view_mode == "Показать полный код":
+                    render_code_with_changes(version.source_code, prev_version.source_code)
+
+
+def render_function_tables_tab(schema: dict) -> None:
+    """Вкладка для поиска таблиц, используемых в функции."""
+    with st.form("function_tables_form"):
+        function_name = st.text_input(
+            "Название функции",
+            value=st.session_state.get("function_tables_query", ""),
+            placeholder="Введите точное название функции",
+        )
+        submitted = st.form_submit_button("Найти таблицы", use_container_width=True)
+
+    if submitted:
+        clean_name = function_name.strip()
+        st.session_state["function_tables_query"] = clean_name
+        st.session_state["function_tables_error"] = ""
+        st.session_state["function_tables_results"] = []
+
+        if not clean_name:
+            st.session_state["function_tables_error"] = "Введите название функции."
+        else:
+            with st.spinner("Поиск таблиц в функции..."):
+                try:
+                    tables = extract_tables_from_function(clean_name)
+                    st.session_state["function_tables_results"] = tables
+                    if not tables:
+                        st.session_state["function_tables_error"] = (
+                            f"Функция '{clean_name}' не найдена или не использует таблицы (заканчивающиеся на 'tab')."
+                        )
+                except Exception as exc:
+                    st.session_state["function_tables_results"] = []
+                    st.session_state["function_tables_error"] = str(exc)
+
+    error_message = st.session_state.get("function_tables_error", "")
+    if error_message:
+        st.warning(error_message)
+        return
+
+    tables: list[str] = st.session_state.get("function_tables_results", [])
+    
+    if "function_tables_results" not in st.session_state:
+        return
+
+    if not tables:
+        return
+
+    st.success(f"Найдено таблиц: {len(tables)}")
+    
+    # Собираем все структуры таблиц в один текст для копирования
+    all_structures = []
+    all_structures.append(f"Найдено таблиц: {len(tables)}")
+    all_structures.append("=" * 60)
+    all_structures.append("")
+    
+    for table_name in tables:
+        table_info = schema.get(table_name)
+        if table_info:
+            all_structures.append(f"-- {table_name}")
+            all_structures.append(table_info.get("text", "Структура недоступна"))
+            all_structures.append("")
+        else:
+            all_structures.append(f"-- {table_name}")
+            all_structures.append(f"Таблица '{table_name}' не найдена в схеме.")
+            all_structures.append("")
+    
+    total_chars = sum(len(schema[t]["text"]) for t in tables if t in schema)
+    all_structures.append("=" * 60)
+    all_structures.append(f"Символов: {total_chars:,}")
+    
+    result_text = "\n".join(all_structures)
+    
+    # Выводим в виде кода для удобного копирования
+    st.code(result_text, language=None)
+
+
 def main() -> None:
     st.set_page_config(page_title="Tables explorer", layout="wide")
     st.title("Tables explorer")
 
     schema = cached_schema()
     schemas = _schema_names(schema)
-    tables_tab, functions_tab = st.tabs(["Tables", "Функции"])
+    tables_tab, functions_tab, function_tables_tab, timeline_tab = st.tabs(
+        ["Tables", "Функции", "Таблицы из функции", "Timeline функций"]
+    )
 
     with tables_tab:
         render_tables_tab(schema, schemas)
 
     with functions_tab:
         render_functions_tab()
+
+    with function_tables_tab:
+        render_function_tables_tab(schema)
+    
+    with timeline_tab:
+        render_function_timeline_tab()
 
 
 if __name__ == "__main__":
