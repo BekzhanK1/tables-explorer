@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import re
+from typing import Any
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -21,7 +22,14 @@ from db_functions import (
     compute_diff,
     compute_diff_stats,
 )
-from search_schema import _schema_names, load_schema, search_and_format
+from search_schema import (
+    _schema_names,
+    expand_fk,
+    load_schema,
+    parse_columns,
+    search,
+    search_exact_table,
+)
 
 
 @st.cache_resource
@@ -95,6 +103,317 @@ def show_code_modal(record: FunctionRecord, query: str) -> None:
     render_code(record.source_code, query)
 
 
+def _parse_col(col_text: str, item: dict[str, Any]) -> dict:
+    m = re.match(r"^(?P<name>\S+)\s+(?P<ctype>[^\[]+?)(?:\s+\[(?P<flags>.+)\])?$", col_text)
+    if not m:
+        return {"name": col_text, "type": "", "pk": False, "not_null": False, "fk": "", "desc": ""}
+    name = m.group("name")
+    ctype = (m.group("ctype") or "").strip()
+    flags_raw = m.group("flags") or ""
+    flags = [f.strip() for f in flags_raw.split(",")] if flags_raw else []
+    fk_ref = next((f.replace("FK→", "", 1) for f in flags if f.startswith("FK→")), "")
+    desc_map = item.get("columns_description", {})
+    desc = " ".join(str(desc_map.get(name, "")).split())
+    return {
+        "name": name,
+        "type": ctype,
+        "pk": "PK" in flags,
+        "not_null": "NOT NULL" in flags,
+        "fk": fk_ref,
+        "desc": desc,
+    }
+
+
+def _build_llm_text(
+    sorted_tables: list[str],
+    found_direct: set[str],
+    via_map: dict[str, set],
+    schema: dict,
+) -> str:
+    blocks: list[str] = []
+    for table_name in sorted_tables:
+        item = schema.get(table_name)
+        if not item:
+            blocks.append(f"-- {table_name}  [external / not in schema]")
+            continue
+
+        header = f"TABLE {table_name}"
+        if table_name not in found_direct:
+            parents = ", ".join(sorted(via_map.get(table_name, set())))
+            header += f"  [via FK from: {parents}]"
+        blocks.append(header)
+
+        cols = [_parse_col(c, item) for c in parse_columns(item.get("text", ""))]
+        if cols:
+            max_name = max(len(c["name"]) for c in cols)
+            max_type = max(len(c["type"]) for c in cols)
+            for c in cols:
+                flags_parts = []
+                if c["pk"]:
+                    flags_parts.append("PK")
+                if c["fk"]:
+                    flags_parts.append(f"FK→{c['fk']}")
+                if c["not_null"] and not c["pk"]:
+                    flags_parts.append("NOT NULL")
+                flag_str = ("  [" + ", ".join(flags_parts) + "]") if flags_parts else ""
+                desc_str = f"  -- {c['desc']}" if c["desc"] else ""
+                line = (
+                    f"  {c['name']:<{max_name}}  "
+                    f"{c['type']:<{max_type}}"
+                    f"{flag_str}{desc_str}"
+                )
+                blocks.append(line)
+
+        fk_out_raw = item.get("fk_out", [])
+        fk_in_raw = item.get("fk_in", [])
+        fk_out_tables = sorted({ref.split("→")[1].rsplit(".", 1)[0] for ref in fk_out_raw if "→" in ref})
+        fk_in_tables = sorted(set(fk_in_raw))
+        if fk_out_tables:
+            blocks.append(f"  FK_OUT: {', '.join(fk_out_tables)}")
+        if fk_in_tables:
+            blocks.append(f"  FK_IN:  {', '.join(fk_in_tables)}")
+
+        blocks.append("")
+
+    return "\n".join(blocks).rstrip()
+
+
+def _render_table_card(table_name: str, item: dict, is_direct: bool, parents: list[str]) -> None:
+    cols = [_parse_col(c, item) for c in parse_columns(item.get("text", ""))]
+
+    rows_html = ""
+    for c in cols:
+        badges = ""
+        if c["pk"]:
+            badges += "<span style='background:#854d0e;color:#fef3c7;border-radius:3px;padding:1px 5px;font-size:11px;margin-right:3px'>PK</span>"
+        if c["fk"]:
+            short_ref = c["fk"].rsplit(".", 1)[0] if "." in c["fk"] else c["fk"]
+            fk_full = html.escape(c["fk"])
+            fk_short = html.escape(short_ref)
+            badges += (
+                f"<span style='background:#1e3a5f;color:#93c5fd;border-radius:3px;"
+                f"padding:1px 5px;font-size:11px;margin-right:3px' title='FK→{fk_full}'>"
+                f"FK→{fk_short}</span>"
+            )
+        if c["not_null"] and not c["pk"]:
+            badges += "<span style='background:#374151;color:#9ca3af;border-radius:3px;padding:1px 5px;font-size:11px;margin-right:3px'>NOT NULL</span>"
+        desc_cell = f"<span style='color:#9ca3af;font-size:12px'>{html.escape(c['desc'])}</span>" if c["desc"] else ""
+        rows_html += (
+            f"<tr>"
+            f"<td style='padding:5px 10px;font-family:monospace;color:#e2e8f0;white-space:nowrap'>{html.escape(c['name'])}</td>"
+            f"<td style='padding:5px 10px;font-family:monospace;color:#7dd3fc;white-space:nowrap'>{html.escape(c['type'])}</td>"
+            f"<td style='padding:5px 10px'>{badges}</td>"
+            f"<td style='padding:5px 10px'>{desc_cell}</td>"
+            f"</tr>"
+        )
+
+    # fk_out entries are "col→schema.table.col" — extract unique referenced tables
+    fk_out_raw = item.get("fk_out", [])
+    fk_in_raw = item.get("fk_in", [])
+    fk_out_tables = sorted({ref.split("→")[1].rsplit(".", 1)[0] for ref in fk_out_raw if "→" in ref})
+    fk_in_tables = sorted(set(fk_in_raw))
+
+    footer_html = ""
+    if fk_out_tables or fk_in_tables:
+        def _pill(label: str) -> str:
+            return (
+                f"<span style='display:inline-block;background:#1e293b;border:1px solid #334155;"
+                f"border-radius:4px;padding:1px 7px;margin:2px 3px 2px 0;"
+                f"font-size:11px;color:#94a3b8;font-family:monospace'>{html.escape(label)}</span>"
+            )
+        rows = ""
+        if fk_out_tables:
+            pills = "".join(_pill(t) for t in fk_out_tables)
+            rows += f"<tr><td style='padding:4px 10px;color:#6b7280;font-size:11px;white-space:nowrap;vertical-align:top'>FK out →</td><td style='padding:4px 6px'>{pills}</td></tr>"
+        if fk_in_tables:
+            pills = "".join(_pill(t) for t in fk_in_tables)
+            rows += f"<tr><td style='padding:4px 10px;color:#6b7280;font-size:11px;white-space:nowrap;vertical-align:top'>← FK in</td><td style='padding:4px 6px'>{pills}</td></tr>"
+        footer_html = (
+            f"<div style='border-top:1px solid #2d3748;padding:4px 0'>"
+            f"<table style='border-collapse:collapse;width:100%'>{rows}</table></div>"
+        )
+
+    via_html = ""
+    if not is_direct:
+        via_html = f"<div style='color:#6b7280;font-size:12px;margin-bottom:6px'>via FK from: {html.escape(', '.join(parents))}</div>"
+
+    table_html = (
+        "<div style='background:#1a202c;border:1px solid #2d3748;border-radius:8px;"
+        "overflow:hidden;margin-bottom:4px'>"
+        + via_html
+        + "<table style='width:100%;border-collapse:collapse'>"
+        "<thead><tr style='background:#2d3748'>"
+        "<th style='padding:6px 10px;text-align:left;color:#94a3b8;font-size:12px;font-weight:600'>column</th>"
+        "<th style='padding:6px 10px;text-align:left;color:#94a3b8;font-size:12px;font-weight:600'>type</th>"
+        "<th style='padding:6px 10px;text-align:left;color:#94a3b8;font-size:12px;font-weight:600'>flags</th>"
+        "<th style='padding:6px 10px;text-align:left;color:#94a3b8;font-size:12px;font-weight:600'>description</th>"
+        "</tr></thead>"
+        f"<tbody>{rows_html}</tbody>"
+        "</table>"
+        + footer_html
+        + "</div>"
+    )
+    st.markdown(table_html, unsafe_allow_html=True)
+
+
+def _mermaid_safe(name: str) -> str:
+    return name.replace(".", "__").replace("-", "_").replace(" ", "_")
+
+
+def _mermaid_type(t: str) -> str:
+    return t.split("(")[0].replace(" ", "_") or "text"
+
+
+def _mermaid_field_name(name: str) -> str:
+    # Mermaid identifiers can't start with a digit
+    safe = re.sub(r"[^a-zA-Z0-9_]", "_", name)
+    return f"_{safe}" if safe and safe[0].isdigit() else safe
+
+
+def _build_mermaid(
+    sorted_tables: list[str],
+    found_direct: set[str],
+    schema: dict,
+) -> str:
+    in_scope = set(sorted_tables)
+    lines = ["erDiagram"]
+
+    for table_name in sorted_tables:
+        item = schema.get(table_name)
+        if not item:
+            continue
+        safe = _mermaid_safe(table_name)
+        cols = [_parse_col(c, item) for c in parse_columns(item.get("text", ""))]
+        # Only show PK and FK columns — non-key cols clutter the diagram
+        field_lines: list[str] = []
+        for c in cols:
+            if c["pk"]:
+                field_lines.append(f"        {_mermaid_type(c['type'])} {_mermaid_field_name(c['name'])} PK")
+            elif c["fk"]:
+                field_lines.append(f"        {_mermaid_type(c['type'])} {_mermaid_field_name(c['name'])} FK")
+        if not field_lines:
+            # Table has no PK/FK — show first col so the box isn't empty
+            for c in cols[:1]:
+                field_lines.append(f"        {_mermaid_type(c['type'])} {_mermaid_field_name(c['name'])}")
+        lines.append(f"    {safe} {{")
+        lines.extend(field_lines)
+        lines.append("    }")
+
+    seen_rels: set[tuple[str, str]] = set()
+    for table_name in sorted_tables:
+        item = schema.get(table_name)
+        if not item:
+            continue
+        safe_from = _mermaid_safe(table_name)
+        for fk_str in item.get("fk_out", []):
+            if "→" not in fk_str:
+                continue
+            col_part, ref_part = fk_str.split("→", 1)
+            ref_table = ref_part.rsplit(".", 1)[0]
+            if ref_table not in in_scope:
+                continue
+            safe_to = _mermaid_safe(ref_table)
+            key = (safe_from, safe_to)
+            if key in seen_rels:
+                continue
+            seen_rels.add(key)
+            lines.append(f'    {safe_from} }}o--|| {safe_to} : "{col_part}"')
+
+    return "\n".join(lines)
+
+
+def _render_mermaid(mermaid_code: str, n_tables: int) -> None:
+    height = 720
+    escaped = (
+        mermaid_code
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("`", "&#96;")
+        .replace("$", "&#36;")
+    )
+    page = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<script src="https://cdn.jsdelivr.net/npm/svg-pan-zoom@3.6.1/dist/svg-pan-zoom.min.js"></script>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ background: #0f172a; overflow: hidden; font-family: sans-serif; }}
+  #controls {{
+    position: fixed; top: 8px; right: 8px; z-index: 100;
+    display: flex; gap: 4px;
+  }}
+  #controls button {{
+    background: #1e293b; color: #94a3b8;
+    border: 1px solid #334155; border-radius: 4px;
+    padding: 4px 12px; cursor: pointer; font-size: 15px; line-height: 1.4;
+  }}
+  #controls button:hover {{ background: #334155; color: #e2e8f0; }}
+  #hint {{
+    position: fixed; bottom: 8px; left: 8px;
+    color: #475569; font-size: 11px;
+  }}
+  #wrap {{ width: 100%; height: {height}px; }}
+  #wrap svg {{ width: 100%; height: 100%; }}
+  #status {{ color: #94a3b8; padding: 24px; font-size: 14px; }}
+  #err {{ color: #f87171; padding: 16px; white-space: pre-wrap; font-size: 13px; font-family: monospace; }}
+</style>
+</head>
+<body>
+<div id="controls">
+  <button id="btn-in" title="Zoom in">+</button>
+  <button id="btn-out" title="Zoom out">−</button>
+  <button id="btn-reset" title="Fit to screen">⊡</button>
+</div>
+<div id="hint">Scroll to zoom · Drag to pan</div>
+<div id="wrap">
+  <div id="status">Rendering diagram…</div>
+  <div id="src" style="display:none">{escaped}</div>
+</div>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({{ startOnLoad: false, theme: 'dark' }});
+
+  const wrap = document.getElementById('wrap');
+  let pz = null;
+
+  try {{
+    const source = document.getElementById('src').textContent;
+    const {{ svg }} = await mermaid.render('mg', source);
+    wrap.innerHTML = svg;
+
+    const svgEl = wrap.querySelector('svg');
+    svgEl.removeAttribute('width');
+    svgEl.removeAttribute('height');
+    svgEl.style.width  = '100%';
+    svgEl.style.height = '100%';
+
+    pz = svgPanZoom(svgEl, {{
+      zoomEnabled: true,
+      panEnabled: true,
+      controlIconsEnabled: false,
+      fit: true,
+      center: true,
+      minZoom: 0.02,
+      maxZoom: 20,
+      zoomScaleSensitivity: 0.35,
+    }});
+
+    window.addEventListener('resize', () => {{ pz.resize(); pz.fit(); pz.center(); }});
+  }} catch (e) {{
+    wrap.innerHTML = '<div id="err">Mermaid error:\\n' + e.message + '</div>';
+  }}
+
+  document.getElementById('btn-in').onclick    = () => pz && pz.zoomIn();
+  document.getElementById('btn-out').onclick   = () => pz && pz.zoomOut();
+  document.getElementById('btn-reset').onclick = () => {{ if (pz) {{ pz.resetZoom(); pz.fit(); pz.center(); }} }};
+</script>
+</body>
+</html>"""
+    components.html(page, height=height + 10, scrolling=False)
+
+
 def render_tables_tab(schema: dict, schemas: list[str]) -> None:
     with st.sidebar:
         st.header("Options")
@@ -103,7 +422,6 @@ def render_tables_tab(schema: dict, schemas: list[str]) -> None:
         )
         fuzzy = st.checkbox("Fuzzy", value=False, key="tables_fuzzy")
         fk = st.checkbox("Expand FK", value=True, key="tables_fk")
-        pretty = st.checkbox("Pretty", value=True, key="tables_pretty")
         depth = st.number_input(
             "FK depth", min_value=1, max_value=20, value=1, step=1, key="tables_depth"
         )
@@ -122,11 +440,47 @@ def render_tables_tab(schema: dict, schemas: list[str]) -> None:
         st.warning("Enter a query.")
         return
 
-    result = search_and_format(
-        q, schema, fuzzy=fuzzy, fk=fk, depth=int(depth), pretty=pretty,
-        schema_filter=schema_filter,
+    found_direct = (
+        search(q, schema, schema_filter) if fuzzy else search_exact_table(q, schema, schema_filter)
     )
-    st.code(result, language=None)
+    if not found_direct:
+        st.warning("Nothing found.")
+        return
+
+    via_map = (
+        expand_fk(found_direct, schema, depth=int(depth))
+        if fk
+        else {t: set() for t in found_direct}
+    )
+    all_tables = set(via_map.keys())
+    sorted_tables = sorted(all_tables, key=lambda t: (t not in found_direct, t))
+
+    st.caption(
+        f"Tables: {len(all_tables)} · Direct: {len(found_direct)} · Via FK: {len(all_tables) - len(found_direct)}"
+    )
+
+    llm_text = _build_llm_text(sorted_tables, found_direct, via_map, schema)
+    with st.expander("📋 Copy for LLM", expanded=True):
+        st.code(llm_text, language=None)
+
+    cards_tab, diagram_tab = st.tabs(["Cards", "Diagram"])
+
+    with cards_tab:
+        for table_name in sorted_tables:
+            item = schema.get(table_name)
+            if not item:
+                st.warning(f"{table_name} (external)")
+                continue
+            parents = sorted(via_map.get(table_name, set()))
+            is_direct = table_name in found_direct
+            with st.expander(table_name, expanded=is_direct):
+                _render_table_card(table_name, item, is_direct, parents)
+
+    with diagram_tab:
+        mermaid_code = _build_mermaid(sorted_tables, found_direct, schema)
+        _render_mermaid(mermaid_code, len(sorted_tables))
+        with st.expander("Mermaid source", expanded=False):
+            st.code(mermaid_code, language="text")
 
 
 def render_functions_tab() -> None:

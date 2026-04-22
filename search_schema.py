@@ -12,6 +12,14 @@ from pathlib import Path
 SCHEMA_PATH = Path("output/schema_compact.json")
 
 
+def _normalize_desc(value: str) -> str:
+    return " ".join(str(value).split())
+
+
+def _column_name_from_pretty_col(col: str) -> str:
+    return col.split(" ", 1)[0]
+
+
 def load_schema() -> dict:
     with open(SCHEMA_PATH, encoding="utf-8") as f:
         data = json.load(f)
@@ -100,6 +108,13 @@ def format_output(via_map: dict, schema: dict, found_direct: set) -> str:
             tag = f" [via FK from: {', '.join(sorted(parents))}]"
         lines.append(f"-- {table_name}{tag}")
         lines.append(item["text"])
+        desc_map = item.get("columns_description", {})
+        if desc_map:
+            lines.append("Column descriptions:")
+            for col in item.get("columns", []):
+                desc = desc_map.get(col)
+                if desc:
+                    lines.append(f"  - {col}: {_normalize_desc(desc)}")
         lines.append("")
 
     total = sum(len(schema[t]["text"]) for t in all_tables if t in schema)
@@ -154,10 +169,14 @@ def format_output_pretty(via_map: dict, schema: dict, found_direct: set) -> str:
             return
 
         cols = parse_columns(item.get("text", ""))
+        desc_map = item.get("columns_description", {})
         lines.append(f"{indent}┌─ {table_name}")
         for i, col in enumerate(cols):
             branch = "└── " if i == len(cols) - 1 else "├── "
-            lines.append(f"{indent}│   {branch}{col}")
+            col_name = _column_name_from_pretty_col(col)
+            desc = desc_map.get(col_name)
+            desc_suffix = f" -- {_normalize_desc(desc)}" if desc else ""
+            lines.append(f"{indent}│   {branch}{col}{desc_suffix}")
 
         if has_children:
             lines.append(f"{indent}│")

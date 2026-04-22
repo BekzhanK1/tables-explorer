@@ -69,6 +69,7 @@ for (table_schema, table_name), group in cols_df.groupby(
     q_key = qualified(table_schema, table_name)
     columns = []
     col_names = []
+    col_descriptions = {}
 
     for _, row in group.iterrows():
         col = row["column_name"]
@@ -86,6 +87,13 @@ for (table_schema, table_name), group in cols_df.groupby(
         flag_str = f" [{', '.join(flags)}]" if flags else ""
         columns.append(f"{col} {ctype}{flag_str}")
         col_names.append(col)
+        desc = row.get("columns_description")
+        if pd.isna(desc):
+            desc = row.get("column_description")
+        if pd.notna(desc):
+            desc_str = str(desc).strip()
+            if desc_str and desc_str.lower() != "null":
+                col_descriptions[col] = desc_str
 
     fk_out_list = [
         f"{col}→{ref}"
@@ -102,6 +110,7 @@ for (table_schema, table_name), group in cols_df.groupby(
         "name":   table_name,   # короткое имя без схемы
         "text":   text,
         "columns": col_names,
+        "columns_description": col_descriptions,
         "fk_out": fk_out_list,
         "fk_in":  fk_in_list,
     })
