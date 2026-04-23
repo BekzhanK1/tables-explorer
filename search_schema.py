@@ -3,13 +3,16 @@ python search_schema.py "payment client"
 python search_schema.py "remont" --fk
 python search_schema.py "remont payment client" --fk --depth 2
 python search_schema.py "orders" --schema sale --fk
+python search_schema.py --path-from a_tab --path-to b_tab --schema all
 """
 
 import argparse
 import json
+from collections import deque
 from pathlib import Path
 
-SCHEMA_PATH = Path("output/schema_compact.json")
+_REPO_ROOT = Path(__file__).resolve().parent
+SCHEMA_PATH = _REPO_ROOT / "output" / "schema_compact.json"
 
 
 def _normalize_desc(value: str) -> str:
@@ -51,6 +54,77 @@ def search(query: str, schema: dict, schema_filter: str | None = None) -> set:
     return found
 
 
+def fk_neighbor_tables(table_key: str, schema: dict) -> set[str]:
+    """Соседи в графе FK (исходящие ссылки + таблицы, которые ссылаются на эту)."""
+    n: set[str] = set()
+    item = schema.get(table_key)
+    if not item:
+        return n
+    for fk in item.get("fk_out", []):
+        if "→" not in fk:
+            continue
+        ref_full = fk.split("→", 1)[1]
+        ref_table = ref_full.rsplit(".", 1)[0]
+        n.add(ref_table)
+    for child in item.get("fk_in", []):
+        n.add(child)
+    return n
+
+
+def shortest_fk_path(start: str, end: str, schema: dict) -> list[str] | None:
+    """
+    Кратчайший путь по рёбрам FK (неориентированный BFS).
+    Узлы вне schema_compact.json не рассматриваются как промежуточные.
+    """
+    if start not in schema or end not in schema:
+        return None
+    if start == end:
+        return [start]
+    q: deque[str] = deque([start])
+    prev: dict[str, str | None] = {start: None}
+    while q:
+        u = q.popleft()
+        for v in fk_neighbor_tables(u, schema):
+            if v not in schema:
+                continue
+            if v in prev:
+                continue
+            prev[v] = u
+            if v == end:
+                path: list[str] = []
+                cur: str | None = end
+                while cur is not None:
+                    path.append(cur)
+                    cur = prev[cur]
+                path.reverse()
+                return path
+            q.append(v)
+    return None
+
+
+def resolve_single_table(
+    query: str, schema: dict, schema_filter: str | None = None
+) -> tuple[str | None, str | None]:
+    """
+    Точное имя таблицы или однозначный fuzzy-поиск.
+    Возвращает (ключ_таблицы, сообщение_об_ошибке).
+    """
+    q = (query or "").strip()
+    if not q:
+        return None, "Пустой ввод."
+    exact = search_exact_table(q, schema, schema_filter)
+    if len(exact) == 1:
+        return next(iter(exact)), None
+    fuz = search(q, schema, schema_filter)
+    if len(fuz) == 1:
+        return next(iter(fuz)), None
+    if len(fuz) > 1:
+        return None, f"Неоднозначно: по запросу «{q}» найдено таблиц: {len(fuz)}."
+    if len(exact) > 1:
+        return None, "Неоднозначное точное совпадение (не должно случаться)."
+    return None, f"Таблица «{q}» не найдена."
+
+
 def search_exact_table(
     query: str, schema: dict, schema_filter: str | None = None
 ) -> set:
@@ -76,12 +150,19 @@ def expand_fk(tables: set, schema: dict, depth: int) -> dict:
         for table_key in current:
             item = schema.get(table_key, {})
             for fk in item.get("fk_out", []):
+                if "→" not in fk:
+                    continue
                 # формат: "col→[schema.]to_table.to_col"
                 # берём часть после →, отрезаем последний сегмент (.to_col)
-                ref_full = fk.split("→")[1]          # "[schema.]to_table.to_col"
-                ref = ref_full.rsplit(".", 1)[0]      # "[schema.]to_table"
+                ref_full = fk.split("→")[1]  # "[schema.]to_table.to_col"
+                ref = ref_full.rsplit(".", 1)[0]  # "[schema.]to_table"
                 if ref not in via_map:
                     to_add.setdefault(ref, set()).add(table_key)
+            # Кто ссылается на эту таблицу (дочерние таблицы), напр. contractor ← agreement
+            for child in item.get("fk_in", []):
+                if child not in schema or child in via_map:
+                    continue
+                to_add.setdefault(child, set()).add(table_key)
 
         for t, parents in to_add.items():
             via_map[t] = parents
@@ -235,6 +316,16 @@ def search_and_format(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("query", nargs="?", help="Имя таблицы (по умолчанию точный поиск)")
+    parser.add_argument(
+        "--path-from",
+        metavar="TABLE",
+        help="С `--path-to`: кратчайший путь по FK между двумя таблицами",
+    )
+    parser.add_argument(
+        "--path-to",
+        metavar="TABLE",
+        help="С `--path-from`: кратчайший путь по FK между двумя таблицами",
+    )
     parser.add_argument("--fk",     action="store_true", help="Расширить по FK")
     parser.add_argument("--fuzzy",  action="store_true", help="Поиск по подстрокам")
     parser.add_argument("--depth",  type=int, default=1, help="Глубина FK (default: 1)")
@@ -249,6 +340,25 @@ def main():
 
     schema_filter = None if args.schema == "all" else args.schema
     schema = load_schema()
+
+    if args.path_from or args.path_to:
+        if not args.path_from or not args.path_to:
+            parser.error("Для пути по FK укажите оба аргумента: --path-from и --path-to")
+        a, err_a = resolve_single_table(args.path_from, schema, schema_filter)
+        b, err_b = resolve_single_table(args.path_to, schema, schema_filter)
+        if err_a:
+            print(f"from: {err_a}")
+            raise SystemExit(1)
+        if err_b:
+            print(f"to: {err_b}")
+            raise SystemExit(1)
+        assert a is not None and b is not None
+        path = shortest_fk_path(a, b, schema)
+        if not path:
+            print(f"Путь не найден между «{a}» и «{b}».")
+            raise SystemExit(1)
+        print(" → ".join(path))
+        raise SystemExit(0)
 
     def run(query: str) -> None:
         print(

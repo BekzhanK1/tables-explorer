@@ -3,3 +3,4 @@ pandas
 psycopg[binary]
 python-dotenv
 pygments
+mcp>=1.2

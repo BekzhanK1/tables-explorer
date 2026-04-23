@@ -27,8 +27,17 @@ from search_schema import (
     expand_fk,
     load_schema,
     parse_columns,
+    resolve_single_table,
     search,
     search_exact_table,
+    shortest_fk_path,
+)
+from sql_snippets import (
+    generate_insert_stub,
+    generate_select_columns,
+    generate_select_star,
+    generate_update_stub,
+    join_hints_along_path,
 )
 
 
@@ -270,6 +279,33 @@ def _mermaid_field_name(name: str) -> str:
     return f"_{safe}" if safe and safe[0].isdigit() else safe
 
 
+def _mermaid_flowchart_single(table_name: str, schema: dict) -> str:
+    """One-node ER graphs break Mermaid in some renderers; use a flowchart instead."""
+    item = schema.get(table_name) or {}
+    safe = _mermaid_safe(table_name)
+    node_id = re.sub(r"[^a-zA-Z0-9_]", "_", f"t_{safe}")[:64]
+    if not re.match(r"^[a-zA-Z_]", node_id):
+        node_id = f"t_{node_id}"
+    cols = [_parse_col(c, item) for c in parse_columns(item.get("text", ""))]
+
+    def _esc(s: str) -> str:
+        return s.replace("\"", "'").replace("[", " ").replace("]", " ")
+
+    parts: list[str] = [f"<b>{_esc(table_name)}</b>"]
+    for c in cols[:30]:
+        bits: list[str] = []
+        if c["pk"]:
+            bits.append("PK")
+        if c.get("fk"):
+            bits.append("FK")
+        flags = f" ({', '.join(bits)})" if bits else ""
+        parts.append(f"{_esc(c['name'])}: {_mermaid_type(c['type'])}{flags}")
+    if len(cols) > 30:
+        parts.append("…")
+    label = "<br>".join(parts)
+    return f'flowchart TB\n  {node_id}["{label}"]'
+
+
 def _build_mermaid(
     sorted_tables: list[str],
     found_direct: set[str],
@@ -277,6 +313,7 @@ def _build_mermaid(
 ) -> str:
     in_scope = set(sorted_tables)
     lines = ["erDiagram"]
+    seen_rels: set[tuple[str, str]] = set()
 
     for table_name in sorted_tables:
         item = schema.get(table_name)
@@ -299,7 +336,6 @@ def _build_mermaid(
         lines.extend(field_lines)
         lines.append("    }")
 
-    seen_rels: set[tuple[str, str]] = set()
     for table_name in sorted_tables:
         item = schema.get(table_name)
         if not item:
@@ -319,6 +355,9 @@ def _build_mermaid(
             seen_rels.add(key)
             lines.append(f'    {safe_from} }}o--|| {safe_to} : "{col_part}"')
 
+    in_schema = [t for t in sorted_tables if schema.get(t)]
+    if not seen_rels and len(in_schema) == 1:
+        return _mermaid_flowchart_single(in_schema[0], schema)
     return "\n".join(lines)
 
 
@@ -336,7 +375,6 @@ def _render_mermaid(mermaid_code: str, n_tables: int) -> None:
 <html>
 <head>
 <meta charset="utf-8">
-<script src="https://cdn.jsdelivr.net/npm/svg-pan-zoom@3.6.1/dist/svg-pan-zoom.min.js"></script>
 <style>
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
   body {{ background: #0f172a; overflow: hidden; font-family: sans-serif; }}
@@ -354,8 +392,18 @@ def _render_mermaid(mermaid_code: str, n_tables: int) -> None:
     position: fixed; bottom: 8px; left: 8px;
     color: #475569; font-size: 11px;
   }}
-  #wrap {{ width: 100%; height: {height}px; }}
-  #wrap svg {{ width: 100%; height: 100%; }}
+  #outer {{
+    width: 100%;
+    height: {height}px;
+    overflow: auto;
+    position: relative;
+    cursor: grab;
+    -webkit-user-select: none;
+    user-select: none;
+    touch-action: none;
+  }}
+  #outer.is-dragging {{ cursor: grabbing; }}
+  #outer svg {{ display: block; max-width: none; height: auto; pointer-events: auto; }}
   #status {{ color: #94a3b8; padding: 24px; font-size: 14px; }}
   #err {{ color: #f87171; padding: 16px; white-space: pre-wrap; font-size: 13px; font-family: monospace; }}
 </style>
@@ -364,9 +412,9 @@ def _render_mermaid(mermaid_code: str, n_tables: int) -> None:
 <div id="controls">
   <button id="btn-in" title="Zoom in">+</button>
   <button id="btn-out" title="Zoom out">−</button>
-  <button id="btn-reset" title="Fit to screen">⊡</button>
+  <button id="btn-reset" title="Reset zoom">⊡</button>
 </div>
-<div id="hint">Scroll to zoom · Drag to pan</div>
+<div id="hint">Зажмите левую кнопку и тяните · колёсико = прокрутка · +/− = масштаб</div>
 <div id="wrap">
   <div id="status">Rendering diagram…</div>
   <div id="src" style="display:none">{escaped}</div>
@@ -376,42 +424,130 @@ def _render_mermaid(mermaid_code: str, n_tables: int) -> None:
   mermaid.initialize({{ startOnLoad: false, theme: 'dark' }});
 
   const wrap = document.getElementById('wrap');
-  let pz = null;
+
+  function svgNumericSize(svg) {{
+    let w = parseFloat(svg.getAttribute('width'));
+    let h = parseFloat(svg.getAttribute('height'));
+    if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) {{
+      return {{ w, h }};
+    }}
+    const vb = svg.viewBox && svg.viewBox.baseVal;
+    if (vb && vb.width > 0 && vb.height > 0) {{
+      return {{ w: vb.width, h: vb.height }};
+    }}
+    try {{
+      const b = svg.getBBox();
+      if (b.width > 0 && b.height > 0) return {{ w: b.width, h: b.height }};
+    }} catch (e) {{ /* detached */ }}
+    return {{ w: 800, h: 600 }};
+  }}
+
+  function applyZoom(svg, scale) {{
+    const s = Math.max(0.02, Math.min(20, scale));
+    const base = svg.__base || (svg.__base = svgNumericSize(svg));
+    const rw = base.w * s;
+    const rh = base.h * s;
+    svg.setAttribute('width', String(rw));
+    svg.setAttribute('height', String(rh));
+    svg.setAttribute('preserveAspectRatio', 'xMinYMin meet');
+    svg.__zoom = s;
+    return s;
+  }}
+
+  function setupDragPan(outer) {{
+    let active = null;
+    const onDown = (e) => {{
+      if (e.button !== 0) return;
+      if (e.target && e.target.closest && e.target.closest('button')) return;
+      e.preventDefault();
+      active = {{
+        id: e.pointerId,
+        x0: e.clientX,
+        y0: e.clientY,
+        sl0: outer.scrollLeft,
+        st0: outer.scrollTop,
+      }};
+      try {{ outer.setPointerCapture(e.pointerId); }} catch (err) {{}}
+      outer.classList.add('is-dragging');
+    }};
+    const onMove = (e) => {{
+      if (!active || e.pointerId !== active.id) return;
+      e.preventDefault();
+      const dx = e.clientX - active.x0;
+      const dy = e.clientY - active.y0;
+      outer.scrollLeft = active.sl0 - dx;
+      outer.scrollTop = active.st0 - dy;
+    }};
+    const onEnd = (e) => {{
+      if (!active || e.pointerId !== active.id) return;
+      active = null;
+      outer.classList.remove('is-dragging');
+      try {{ outer.releasePointerCapture(e.pointerId); }} catch (err) {{}}
+    }};
+    outer.addEventListener('pointerdown', onDown, {{ passive: false }});
+    outer.addEventListener('pointermove', onMove, {{ passive: false }});
+    outer.addEventListener('pointerup', onEnd);
+    outer.addEventListener('pointercancel', onEnd);
+    outer.addEventListener('lostpointercapture', onEnd);
+  }}
+
+  let svgEl = null;
 
   try {{
     const source = document.getElementById('src').textContent;
-    const {{ svg }} = await mermaid.render('mg', source);
-    wrap.innerHTML = svg;
+    const renderId = 'g' + Math.random().toString(36).slice(2) + 'g';
+    const {{ svg }} = await mermaid.render(renderId, source);
+    const outer = document.createElement('div');
+    outer.id = 'outer';
+    outer.innerHTML = svg;
+    wrap.innerHTML = '';
+    wrap.appendChild(outer);
 
-    const svgEl = wrap.querySelector('svg');
-    svgEl.removeAttribute('width');
-    svgEl.removeAttribute('height');
-    svgEl.style.width  = '100%';
-    svgEl.style.height = '100%';
-
-    pz = svgPanZoom(svgEl, {{
-      zoomEnabled: true,
-      panEnabled: true,
-      controlIconsEnabled: false,
-      fit: true,
-      center: true,
-      minZoom: 0.02,
-      maxZoom: 20,
-      zoomScaleSensitivity: 0.35,
-    }});
-
-    window.addEventListener('resize', () => {{ pz.resize(); pz.fit(); pz.center(); }});
+    svgEl = outer.querySelector('svg');
+    if (!svgEl) {{
+      throw new Error('Mermaid returned no <svg> root.');
+    }}
+    svgEl.__base = null;
+    applyZoom(svgEl, 1);
+    setupDragPan(outer);
   }} catch (e) {{
-    wrap.innerHTML = '<div id="err">Mermaid error:\\n' + e.message + '</div>';
+    wrap.innerHTML = '<div id="err">Mermaid error:\\n' + (e && e.message ? e.message : e) + '</div>';
   }}
 
-  document.getElementById('btn-in').onclick    = () => pz && pz.zoomIn();
-  document.getElementById('btn-out').onclick   = () => pz && pz.zoomOut();
-  document.getElementById('btn-reset').onclick = () => {{ if (pz) {{ pz.resetZoom(); pz.fit(); pz.center(); }} }};
+  if (svgEl) {{
+    document.getElementById('btn-in').onclick = () => {{ applyZoom(svgEl, (svgEl.__zoom || 1) * 1.25); }};
+    document.getElementById('btn-out').onclick = () => {{ applyZoom(svgEl, (svgEl.__zoom || 1) / 1.25); }};
+    document.getElementById('btn-reset').onclick = () => {{
+      if (svgEl) svgEl.__base = null;
+      applyZoom(svgEl, 1);
+      const o = document.getElementById('outer');
+      if (o) {{ o.scrollLeft = 0; o.scrollTop = 0; }}
+    }};
+  }} else {{
+    const noop = () => {{}};
+    document.getElementById('btn-in').onclick = noop;
+    document.getElementById('btn-out').onclick = noop;
+    document.getElementById('btn-reset').onclick = noop;
+  }}
 </script>
 </body>
 </html>"""
     components.html(page, height=height + 10, scrolling=False)
+
+
+def _render_sql_snippets(table_name: str, item: dict[str, Any]) -> None:
+    st.markdown("**SQL шаблоны**")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.caption("SELECT *")
+        st.code(generate_select_star(table_name, item), language="sql")
+        st.caption("SELECT — все колонки явно")
+        st.code(generate_select_columns(table_name, item), language="sql")
+    with c2:
+        st.caption("INSERT")
+        st.code(generate_insert_stub(table_name, item), language="sql")
+        st.caption("UPDATE")
+        st.code(generate_update_stub(table_name, item), language="sql")
 
 
 def render_tables_tab(schema: dict, schemas: list[str]) -> None:
@@ -427,6 +563,42 @@ def render_tables_tab(schema: dict, schemas: list[str]) -> None:
         )
 
     schema_filter = None if schema_filter_label == "all" else schema_filter_label
+
+    with st.expander("Кратчайший путь по FK", expanded=False):
+        st.caption(
+            "Точное имя таблицы или однозначный fuzzy в выбранной схеме. "
+            "Для пути между разными схемами выберите **Schema: all**."
+        )
+        with st.form("fk_path_form"):
+            path_from = st.text_input(
+                "От таблицы",
+                placeholder="schema.table или короткое имя",
+                key="fk_path_from_input",
+            )
+            path_to = st.text_input(
+                "К таблице",
+                placeholder="schema.table или короткое имя",
+                key="fk_path_to_input",
+            )
+            path_submitted = st.form_submit_button("Найти путь")
+        if path_submitted:
+            fa, err_a = resolve_single_table(path_from.strip(), schema, schema_filter)
+            fb, err_b = resolve_single_table(path_to.strip(), schema, schema_filter)
+            if err_a:
+                st.warning(f"«От»: {err_a}")
+            elif err_b:
+                st.warning(f"«К»: {err_b}")
+            elif fa is not None and fb is not None:
+                path = shortest_fk_path(fa, fb, schema)
+                if not path:
+                    st.warning(f"Путь между `{fa}` и `{fb}` не найден.")
+                else:
+                    st.success(" → ".join(path))
+                    hints = join_hints_along_path(path, schema)
+                    if hints.strip():
+                        st.code(hints, language="sql")
+                    mini = _build_mermaid(path, {path[0]}, schema)
+                    _render_mermaid(mini, len(path))
 
     with st.form("search_form"):
         query = st.text_input("Table name or query", "")
@@ -475,6 +647,7 @@ def render_tables_tab(schema: dict, schemas: list[str]) -> None:
             is_direct = table_name in found_direct
             with st.expander(table_name, expanded=is_direct):
                 _render_table_card(table_name, item, is_direct, parents)
+                _render_sql_snippets(table_name, item)
 
     with diagram_tab:
         mermaid_code = _build_mermaid(sorted_tables, found_direct, schema)

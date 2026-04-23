@@ -26,16 +26,44 @@ python search_schema.py "audit_phone_tab" --schema admin --fk --pretty
 python search_schema.py "client_request_tab" --schema all --fuzzy
 ```
 
+Кратчайший путь по FK (неориентированный граф, как во вкладке Tables в UI):
+
+```bash
+python search_schema.py --path-from admin.audit_phone_tab --path-to client_request_tab --schema all
+```
+
+## MCP для Cursor
+
+Локальный stdio-сервер `tables_explorer_mcp.py`: инструменты `get_table`, `search_tables`, `fk_shortest_path` (плюс SQL-шаблоны внутри `get_table`).
+
+Пример конфигурации (подставьте абсолютные пути):
+
+```json
+{
+  "mcpServers": {
+    "tables-explorer": {
+      "command": "/ABS/PATH/tables-explorer/.venv/bin/python",
+      "args": ["/ABS/PATH/tables-explorer/tables_explorer_mcp.py"]
+    }
+  }
+}
+```
+
+Если в логах MCP `spawn ... wsl.exe ENOENT`, вы почти наверняка в **Remote-WSL**: не вызывайте `wsl.exe`, укажите в `command` путь к `python` внутри Linux (как в примере выше). Подробнее — докстринг в `tables_explorer_mcp.py`.
+
+Перед использованием выполните `python build_schema.py`, чтобы существовал `output/schema_compact.json`.
+
 ## Streamlit UI
 
 ```bash
 streamlit run app.py --server.port 9234
 ```
 
-В приложении есть 2 вкладки:
+Вкладки в UI:
 
-- `Tables` — поиск по собранному `output/schema_compact.json`
+- `Tables` — поиск по `output/schema_compact.json`, карточки, Mermaid, копирование для LLM, **SQL-шаблоны** (SELECT/INSERT/UPDATE), **кратчайший путь по FK** (expander над поиском)
 - `Функции` — live-поиск по `version_tab` в PostgreSQL
+- `Таблицы из функции`, `Timeline функций` — см. `app.py`
 
 ## Настройка .env для вкладки `Функции`
 
