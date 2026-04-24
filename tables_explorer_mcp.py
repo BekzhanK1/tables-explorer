@@ -39,16 +39,18 @@ MCP (stdio) для Cursor: чтение schema_compact.json, поиск табл
 """
 
 from __future__ import annotations
-from sql_snippets import (generate_insert_stub, generate_select_columns,
-                          generate_select_star, generate_update_stub,
-                          join_hints_along_path)
-from search_schema import (load_schema, resolve_single_table,
-                           search_and_format, shortest_fk_path)
-from mcp.server.fastmcp import FastMCP
 
 import json
 import sys
 from pathlib import Path
+
+from mcp.server.fastmcp import FastMCP
+
+from search_schema import (load_schema, resolve_single_table,
+                           search_and_format, shortest_fk_path)
+from sql_snippets import (generate_insert_stub, generate_select_columns,
+                          generate_select_star, generate_update_stub,
+                          join_hints_along_path)
 
 _REPO = Path(__file__).resolve().parent
 if str(_REPO) not in sys.path:
@@ -136,12 +138,14 @@ def search_tables(query: str, fuzzy: bool = False, schema_name: str | None = Non
         query,
         _schema(),
         fuzzy=fuzzy,
-        fk=False,
+        fk=True,
         depth=1,
         pretty=False,
         schema_filter=sch,
     )
 
 
+if __name__ == "__main__":
+    mcp.run()
 if __name__ == "__main__":
     mcp.run()
