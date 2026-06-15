@@ -3,11 +3,19 @@ from __future__ import annotations
 import difflib
 import os
 from dataclasses import dataclass
-from typing import Any
+from datetime import date, datetime, time, timedelta
+from typing import Any, Literal
 
 from dotenv import load_dotenv
 import psycopg
 from psycopg.rows import dict_row
+
+from app_settings import (
+    DbProfile,
+    get_active_profile,
+    import_from_env_if_empty,
+    profiles_for_timeline,
+)
 
 
 MIN_QUERY_LEN = 6
@@ -91,14 +99,18 @@ class FunctionVersion:
 
 
 def _load_db_settings() -> dict[str, Any]:
-    load_dotenv()
+    import_from_env_if_empty()
+    profile = get_active_profile()
+    if profile is not None:
+        return profile.connection_kwargs()
 
+    load_dotenv()
     required_keys = ["PGHOST", "PGDATABASE", "PGUSER", "PGPASSWORD"]
     missing = [key for key in required_keys if not os.getenv(key)]
     if missing:
         missing_list = ", ".join(missing)
         raise ValueError(
-            f"Missing database settings in .env: {missing_list}"
+            f"Нет активного подключения в настройках и не заполнен .env: {missing_list}"
         )
 
     settings: dict[str, Any] = {
@@ -118,14 +130,14 @@ def _load_db_settings() -> dict[str, Any]:
 
 
 def _discover_databases() -> list[dict[str, Any]]:
-    """
-    Автоматически обнаруживает все настроенные базы данных из .env
-    Формат: DB_{NAME}_HOST, DB_{NAME}_DATABASE, и т.д.
-    """
+    import_from_env_if_empty()
+    profiles = profiles_for_timeline()
+    if profiles:
+        return profiles
+
     load_dotenv()
     databases = []
     
-    # 1. Основная база (обязательная)
     main_db = {
         "name": "main",
         "host": os.getenv("PGHOST"),
@@ -143,7 +155,6 @@ def _discover_databases() -> list[dict[str, Any]]:
     if all([main_db["host"], main_db["dbname"], main_db["user"], main_db["password"]]):
         databases.append(main_db)
     
-    # 2. Поиск дополнительных баз по паттерну DB_{NAME}_HOST
     env_vars = os.environ
     db_names = set()
     
@@ -152,7 +163,6 @@ def _discover_databases() -> list[dict[str, Any]]:
             db_name = key.replace("DB_", "").replace("_HOST", "")
             db_names.add(db_name)
     
-    # 3. Сборка конфигурации для каждой найденной базы
     for db_name in sorted(db_names):
         prefix = f"DB_{db_name}_"
         
@@ -175,6 +185,18 @@ def _discover_databases() -> list[dict[str, Any]]:
             databases.append(db_config)
     
     return databases
+
+
+def get_active_db_label() -> str:
+    profile = get_active_profile()
+    if profile is not None:
+        return f"{profile.name} ({profile.host}/{profile.dbname})"
+    load_dotenv()
+    host = os.getenv("PGHOST")
+    dbname = os.getenv("PGDATABASE")
+    if host and dbname:
+        return f".env ({host}/{dbname})"
+    return "не настроено"
 
 
 def fetch_functions(query: str, limit: int = DEFAULT_LIMIT) -> list[FunctionRecord]:
@@ -414,6 +436,269 @@ def compute_diff(old_code: str, new_code: str) -> str:
     )
     
     return ''.join(diff)
+
+
+PeriodExportMode = Literal["latest_per_function", "all_versions"]
+
+
+@dataclass(frozen=True)
+class PeriodExportOptions:
+    date_from: date
+    date_to: date
+    pg_user: str | None = None
+    schema_name: str | None = None
+    mode: PeriodExportMode = "latest_per_function"
+    limit: int = 500
+
+
+FUNCTIONS_PERIOD_SQL_LATEST_HEAD = """
+SELECT DISTINCT ON (t.schema_name, t.function_name)
+       t.version_id,
+       t.function_name,
+       t.schema_name,
+       t.source_code,
+       t.rowversion,
+       t.employee_id,
+       t.pg_user,
+       t.is_from_compare
+FROM version_tab t
+"""
+
+FUNCTIONS_PERIOD_SQL_ALL_HEAD = """
+SELECT t.version_id,
+       t.function_name,
+       t.schema_name,
+       t.source_code,
+       t.rowversion,
+       t.employee_id,
+       t.pg_user,
+       t.is_from_compare
+FROM version_tab t
+"""
+
+
+def _build_period_sql(options: PeriodExportOptions) -> tuple[str, dict[str, Any]]:
+    date_from, date_to_exclusive = _period_bounds(options.date_from, options.date_to)
+    head = (
+        FUNCTIONS_PERIOD_SQL_LATEST_HEAD
+        if options.mode == "latest_per_function"
+        else FUNCTIONS_PERIOD_SQL_ALL_HEAD
+    )
+    conditions = [
+        "t.rowversion >= %(date_from)s",
+        "t.rowversion < %(date_to_exclusive)s",
+    ]
+    params: dict[str, Any] = {
+        "date_from": date_from,
+        "date_to_exclusive": date_to_exclusive,
+        "limit": options.limit,
+    }
+    if options.pg_user:
+        conditions.append("t.pg_user = %(pg_user)s")
+        params["pg_user"] = options.pg_user
+    if options.schema_name:
+        conditions.append("t.schema_name = %(schema_name)s")
+        params["schema_name"] = options.schema_name
+
+    order = (
+        "t.schema_name, t.function_name, t.rowversion DESC"
+        if options.mode == "latest_per_function"
+        else "t.rowversion DESC, t.schema_name, t.function_name"
+    )
+    sql = (
+        f"{head.strip()}\n"
+        f"WHERE {' AND '.join(conditions)}\n"
+        f"ORDER BY {order}\n"
+        f"LIMIT %(limit)s;"
+    )
+    return sql, params
+
+PG_USERS_SQL = """
+SELECT DISTINCT t.pg_user
+FROM version_tab t
+WHERE t.pg_user IS NOT NULL
+  AND btrim(t.pg_user) <> ''
+ORDER BY t.pg_user;
+"""
+
+
+def _period_bounds(date_from: date, date_to: date) -> tuple[datetime, datetime]:
+    if date_to < date_from:
+        raise ValueError("date_to must be >= date_from")
+    start = datetime.combine(date_from, time.min)
+    end_exclusive = datetime.combine(date_to + timedelta(days=1), time.min)
+    return start, end_exclusive
+
+
+def _row_to_function_record(row: dict[str, Any]) -> FunctionRecord:
+    return FunctionRecord(
+        version_id=row["version_id"],
+        function_name=row["function_name"],
+        schema_name=row["schema_name"],
+        source_code=row["source_code"] or "",
+        rowversion=str(row["rowversion"]) if row["rowversion"] is not None else None,
+        employee_id=row["employee_id"],
+        pg_user=row["pg_user"],
+        is_from_compare=row["is_from_compare"],
+    )
+
+
+def fetch_distinct_pg_users() -> list[str]:
+    with psycopg.connect(**_load_db_settings(), row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(PG_USERS_SQL)
+            rows = cur.fetchall()
+    return [row["pg_user"] for row in rows if row.get("pg_user")]
+
+
+def fetch_functions_by_period(options: PeriodExportOptions) -> list[FunctionRecord]:
+    sql, params = _build_period_sql(options)
+
+    with psycopg.connect(**_load_db_settings(), row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+
+    return [_row_to_function_record(row) for row in rows]
+
+
+def normalize_ddl(source_code: str) -> str:
+    ddl = (source_code or "").rstrip()
+    if not ddl:
+        return ""
+    if not ddl.endswith(";"):
+        ddl += ";"
+    return ddl
+
+
+def build_migration_script(
+    records: list[FunctionRecord],
+    *,
+    include_headers: bool = True,
+) -> str:
+    if not records:
+        return ""
+
+    blocks: list[str] = []
+    for record in records:
+        ddl = normalize_ddl(record.source_code)
+        if not ddl:
+            continue
+        if include_headers:
+            header = (
+                f"-- {record.qualified_name}"
+                f"  [v{record.version_id}, {record.rowversion or '—'}, {record.pg_user or '—'}]"
+            )
+            blocks.append(f"{header}\n{ddl}")
+        else:
+            blocks.append(ddl)
+
+    return "\n\n".join(blocks)
+
+
+CompareStatus = Literal["same", "changed", "new"]
+
+
+@dataclass(frozen=True)
+class FunctionCompareResult:
+    dev: FunctionRecord
+    prod: FunctionRecord | None
+    status: CompareStatus
+
+    @property
+    def qualified_name(self) -> str:
+        return self.dev.qualified_name
+
+
+LATEST_FUNCTIONS_BY_NAMES_SQL = """
+SELECT DISTINCT ON (t.schema_name, t.function_name)
+       t.version_id,
+       t.function_name,
+       t.schema_name,
+       t.source_code,
+       t.rowversion,
+       t.employee_id,
+       t.pg_user,
+       t.is_from_compare
+FROM version_tab t
+WHERE (t.schema_name || '.' || t.function_name) = ANY(%(qualified)s)
+ORDER BY t.schema_name, t.function_name, t.rowversion DESC;
+"""
+
+
+def fetch_latest_functions_on_profile(
+    profile: DbProfile,
+    records: list[FunctionRecord],
+) -> dict[str, FunctionRecord]:
+    if not records:
+        return {}
+
+    qualified = sorted({record.qualified_name for record in records})
+    with psycopg.connect(**profile.connection_kwargs(), row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(LATEST_FUNCTIONS_BY_NAMES_SQL, {"qualified": qualified})
+            rows = cur.fetchall()
+
+    return {
+        _row_to_function_record(row).qualified_name: _row_to_function_record(row)
+        for row in rows
+    }
+
+
+def compare_functions_with_prod(
+    dev_records: list[FunctionRecord],
+    prod_profile: DbProfile,
+) -> list[FunctionCompareResult]:
+    prod_map = fetch_latest_functions_on_profile(prod_profile, dev_records)
+    results: list[FunctionCompareResult] = []
+
+    for dev in dev_records:
+        prod = prod_map.get(dev.qualified_name)
+        if prod is None:
+            status: CompareStatus = "new"
+        elif normalize_ddl(dev.source_code) == normalize_ddl(prod.source_code):
+            status = "same"
+        else:
+            status = "changed"
+        results.append(FunctionCompareResult(dev=dev, prod=prod, status=status))
+
+    return results
+
+
+def filter_compare_results(
+    results: list[FunctionCompareResult],
+    *,
+    only_changed: bool,
+) -> list[FunctionCompareResult]:
+    if not only_changed:
+        return results
+    return [item for item in results if item.status in ("new", "changed")]
+
+
+def compare_status_label(status: CompareStatus) -> str:
+    return {
+        "same": "совпадает с PROD",
+        "changed": "отличается от PROD",
+        "new": "нет на PROD",
+    }[status]
+
+
+def functions_period_sql_preview(options: PeriodExportOptions) -> str:
+    sql, params = _build_period_sql(options)
+
+    def lit(value: Any) -> str:
+        if value is None:
+            return "NULL"
+        if isinstance(value, datetime):
+            return "'" + value.strftime("%Y-%m-%d %H:%M:%S") + "'"
+        if isinstance(value, (int, float)):
+            return str(value)
+        return "'" + str(value).replace("'", "''") + "'"
+
+    rendered = sql
+    for key, value in params.items():
+        rendered = rendered.replace(f"%({key})s", lit(value))
+    return rendered.strip()
 
 
 def compute_diff_stats(old_code: str, new_code: str) -> tuple[int, int]:

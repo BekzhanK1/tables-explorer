@@ -4,7 +4,7 @@ search:
 	python search_schema.py --interactive --fk --pretty
 
 streamlit:
-	streamlit run app.py --server.port 9234
+	streamlit run app.py --server.port 9234 --server.headless true
 
 docker-build:
 	docker build -t $(IMAGE) .

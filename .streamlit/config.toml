@@ -1,0 +1,6 @@
+[server]
+port = 9234
+headless = true
+
+[browser]
+gatherUsageStats = false

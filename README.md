@@ -56,18 +56,29 @@ python search_schema.py --path-from admin.audit_phone_tab --path-to client_reque
 ## Streamlit UI
 
 ```bash
-streamlit run app.py --server.port 9234
+make streamlit
+# или
+streamlit run app.py --server.port 9234 --server.headless true
 ```
+
+Браузер не открывается автоматически (`headless = true` в `.streamlit/config.toml`).
 
 Вкладки в UI:
 
 - `Tables` — поиск по `output/schema_compact.json`, карточки, Mermaid, копирование для LLM, **SQL-шаблоны** (SELECT/INSERT/UPDATE), **кратчайший путь по FK** (expander над поиском)
 - `Функции` — live-поиск по `version_tab` в PostgreSQL
+- `Экспорт DDL` — выгрузка функций за период, фильтр по `pg_user`, сравнение с **PROD**-подключением, скрипт для наката
 - `Таблицы из функции`, `Timeline функций` — см. `app.py`
 
-## Настройка .env для вкладки `Функции`
+## Настройка PostgreSQL
 
-Создай `.env` в корне проекта:
+Подключения хранятся в **SQLite** (`data/app_settings.sqlite3`) и настраиваются в **боковой панели** Streamlit — переключать dev/prod можно без правки `.env`.
+
+При первом запуске, если профилей ещё нет, можно:
+- нажать **«Импорт из .env»** в sidebar, или
+- создать подключение вручную в **«Управление подключениями»**.
+
+Опционально — начальные значения в `.env`:
 
 ```env
 PGHOST=localhost
@@ -79,7 +90,7 @@ PGSSLMODE=prefer
 PGCONNECT_TIMEOUT=5
 ```
 
-Обязательные переменные:
+Обязательные переменные для импорта:
 
 - `PGHOST`
 - `PGDATABASE`

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import re
+from datetime import date, timedelta
 from typing import Any
 
 import streamlit as st
@@ -10,15 +11,40 @@ from pygments import highlight as pyg_highlight
 from pygments.formatters import HtmlFormatter
 from pygments.lexers import get_lexer_by_name
 
+from app_settings import (
+    delete_profile,
+    format_profile_label,
+    get_active_profile,
+    get_prod_db_label,
+    get_prod_profile,
+    get_profile,
+    import_from_env_if_empty,
+    init_db,
+    list_profiles,
+    save_profile,
+    set_active_profile,
+    set_prod_profile,
+    test_connection,
+)
 from db_functions import (
     DEFAULT_LIMIT,
     MIN_QUERY_LEN,
     FunctionRecord,
     FunctionVersion,
+    PeriodExportOptions,
+    FunctionCompareResult,
+    build_migration_script,
+    compare_functions_with_prod,
+    compare_status_label,
+    fetch_distinct_pg_users,
     fetch_functions,
+    fetch_functions_by_period,
+    filter_compare_results,
+    functions_period_sql_preview,
     functions_search_sql_preview,
     extract_tables_from_function,
     fetch_function_timeline,
+    get_active_db_label,
     compute_diff,
     compute_diff_stats,
 )
@@ -39,6 +65,16 @@ from sql_snippets import (
     generate_update_stub,
     join_hints_along_path,
 )
+from search_throttle import allow_search, last_search_label, record_search
+from ui_function_list import render_function_list_panel
+
+
+SEARCH_ACTION_TABLES = "tables"
+SEARCH_ACTION_FUNCTIONS = "functions"
+SEARCH_ACTION_TIMELINE = "timeline"
+SEARCH_ACTION_FUNCTION_TABLES = "function_tables"
+SEARCH_ACTION_MIGRATION = "migration"
+SEARCH_ACTION_FK_PATH = "fk_path"
 
 
 @st.cache_resource
@@ -47,13 +83,50 @@ def cached_schema() -> dict:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def cached_fetch_functions(query: str, limit: int) -> list[FunctionRecord]:
+def cached_fetch_functions(query: str, limit: int, _nonce: int) -> list[FunctionRecord]:
     return fetch_functions(query, limit)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def cached_fetch_timeline(function_name: str, schema_name: str | None, source_db_filter: str | None) -> list[FunctionVersion]:
+def cached_fetch_timeline(
+    function_name: str,
+    schema_name: str | None,
+    source_db_filter: str | None,
+    _nonce: int,
+) -> list[FunctionVersion]:
     return fetch_function_timeline(function_name, schema_name, source_db_filter)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_fetch_pg_users(_nonce: int) -> list[str]:
+    return fetch_distinct_pg_users()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_fetch_functions_by_period(
+    date_from: date,
+    date_to: date,
+    pg_user: str | None,
+    schema_name: str | None,
+    mode: str,
+    limit: int,
+    _nonce: int,
+) -> list[FunctionRecord]:
+    options = PeriodExportOptions(
+        date_from=date_from,
+        date_to=date_to,
+        pg_user=pg_user,
+        schema_name=schema_name,
+        mode=mode,  # type: ignore[arg-type]
+        limit=limit,
+    )
+    return fetch_functions_by_period(options)
+
+
+def _show_last_search(action: str) -> None:
+    label = last_search_label(action)
+    if label:
+        st.caption(f"Последний запрос: {label}")
 
 
 def _lexer_plpgsql():
@@ -550,6 +623,197 @@ def _render_sql_snippets(table_name: str, item: dict[str, Any]) -> None:
         st.code(generate_update_stub(table_name, item), language="sql")
 
 
+def _clear_db_caches() -> None:
+    cached_fetch_functions.clear()
+    cached_fetch_timeline.clear()
+    cached_fetch_pg_users.clear()
+    cached_fetch_functions_by_period.clear()
+
+
+def render_db_settings_sidebar() -> None:
+    with st.sidebar:
+        st.header("PostgreSQL")
+        active = get_active_profile()
+        prod = get_prod_profile()
+        st.caption(f"Источник: {get_active_db_label()}")
+        st.caption(get_prod_db_label())
+
+        profiles = list_profiles()
+        if profiles:
+            profile_names = {p.id: p.name for p in profiles}
+            active_id = active.id if active else profiles[0].id
+            selected_id = st.selectbox(
+                "Источник (dev)",
+                options=list(profile_names.keys()),
+                format_func=lambda pid: format_profile_label(
+                    next(p for p in profiles if p.id == pid),
+                    active=active,
+                    prod=prod,
+                ),
+                index=list(profile_names.keys()).index(active_id),
+                key="db_active_profile_select",
+            )
+            if selected_id != active_id:
+                set_active_profile(selected_id)
+                _clear_db_caches()
+                st.rerun()
+
+            prod_options: list[int | None] = [None] + [p.id for p in profiles]
+            prod_index = 0
+            if prod:
+                try:
+                    prod_index = prod_options.index(prod.id)
+                except ValueError:
+                    prod_index = 0
+            selected_prod_id = st.selectbox(
+                "PROD (для сравнения в экспорте)",
+                options=prod_options,
+                format_func=lambda pid: (
+                    "— не задан —"
+                    if pid is None
+                    else format_profile_label(
+                        next(p for p in profiles if p.id == pid),
+                        active=active,
+                        prod=prod,
+                    )
+                ),
+                index=prod_index,
+                key="db_prod_profile_select",
+            )
+            current_prod_id = prod.id if prod else None
+            if selected_prod_id != current_prod_id:
+                set_prod_profile(selected_prod_id)
+                _clear_db_caches()
+                st.rerun()
+
+        with st.expander("Управление подключениями", expanded=not profiles):
+            editing_id = st.session_state.get("db_edit_profile_id")
+            editing = get_profile(editing_id) if isinstance(editing_id, int) else None
+
+            if editing_id in ("new",) or isinstance(editing_id, int):
+                title = "Новое подключение" if editing_id == "new" else f"Редактирование: {editing.name}"
+                st.markdown(f"**{title}**")
+                with st.form("db_profile_form", clear_on_submit=False):
+                    name = st.text_input("Название", value=editing.name if editing else "")
+                    host = st.text_input("Host", value=editing.host if editing else "localhost")
+                    port = st.number_input(
+                        "Port",
+                        min_value=1,
+                        max_value=65535,
+                        value=editing.port if editing else 5432,
+                    )
+                    dbname = st.text_input("Database", value=editing.dbname if editing else "")
+                    user = st.text_input("User", value=editing.user if editing else "")
+                    password = st.text_input(
+                        "Password",
+                        type="password",
+                        placeholder="оставьте пустым, чтобы не менять" if editing else "",
+                    )
+                    sslmode = st.text_input(
+                        "SSL mode",
+                        value=editing.sslmode or "" if editing else "prefer",
+                    )
+                    connect_timeout = st.number_input(
+                        "Connect timeout (sec)",
+                        min_value=1,
+                        max_value=120,
+                        value=editing.connect_timeout if editing else 5,
+                    )
+                    include_timeline = st.checkbox(
+                        "Включать в Timeline",
+                        value=editing.include_in_timeline if editing else True,
+                    )
+                    make_active = st.checkbox(
+                        "Сделать активным",
+                        value=True if editing_id == "new" or not profiles else False,
+                    )
+
+                    col_save, col_cancel = st.columns(2)
+                    save_clicked = col_save.form_submit_button("Сохранить", use_container_width=True)
+                    cancel_clicked = col_cancel.form_submit_button("Отмена", use_container_width=True)
+
+                if cancel_clicked:
+                    st.session_state.pop("db_edit_profile_id", None)
+                    st.rerun()
+
+                if save_clicked:
+                    try:
+                        save_profile(
+                            profile_id=None if editing_id == "new" else editing_id,
+                            name=name,
+                            host=host,
+                            port=int(port),
+                            dbname=dbname,
+                            user=user,
+                            password=password,
+                            sslmode=sslmode or None,
+                            connect_timeout=int(connect_timeout),
+                            include_in_timeline=include_timeline,
+                            make_active=make_active,
+                        )
+                        st.session_state.pop("db_edit_profile_id", None)
+                        _clear_db_caches()
+                        st.success("Сохранено")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+
+            if profiles:
+                st.divider()
+                for profile in profiles:
+                    tags = []
+                    if active and profile.id == active.id:
+                        tags.append("источник")
+                    if prod and profile.id == prod.id:
+                        tags.append("PROD")
+                    tag_html = "".join(
+                        f'<span style="background:#1e3a5f;color:#4fc3f7;font-size:11px;'
+                        f'padding:1px 6px;border-radius:4px;margin-left:4px">{t}</span>'
+                        for t in tags
+                    )
+                    with st.container(border=True):
+                        st.markdown(
+                            f'<div style="font-weight:600;font-size:14px;margin-bottom:2px">'
+                            f'{profile.name}{tag_html}</div>'
+                            f'<div style="color:#888;font-size:12px;font-family:monospace">'
+                            f'{profile.host}/{profile.dbname}</div>',
+                            unsafe_allow_html=True,
+                        )
+                        btn_l, btn_r = st.columns(2)
+                        if btn_l.button("✏ Изменить", key=f"db_edit_{profile.id}", use_container_width=True):
+                            st.session_state["db_edit_profile_id"] = profile.id
+                            st.rerun()
+                        if btn_r.button("🗑 Удалить", key=f"db_del_{profile.id}", use_container_width=True):
+                            delete_profile(profile.id)
+                            _clear_db_caches()
+                            st.rerun()
+
+            col_new, col_test = (st.columns(2) if profiles else (st.container(), None))
+            if col_new.button("＋ Добавить", use_container_width=True):
+                st.session_state["db_edit_profile_id"] = "new"
+                st.rerun()
+
+            if profiles and col_test is not None:
+                test_profile = get_profile(
+                    st.session_state.get("db_active_profile_select", active.id if active else profiles[0].id)
+                )
+                if test_profile and col_test.button("⚡ Тест", use_container_width=True):
+                    ok, message = test_connection(test_profile)
+                    if ok:
+                        st.success(message)
+                    else:
+                        st.error(message)
+
+            if not profiles and st.button("Импорт из .env", use_container_width=True):
+                imported = import_from_env_if_empty()
+                if imported:
+                    st.success(f"Импортировано: {imported.name}")
+                    _clear_db_caches()
+                    st.rerun()
+                else:
+                    st.warning("В .env нет PGHOST/PGDATABASE/PGUSER/PGPASSWORD")
+
+
 def render_tables_tab(schema: dict, schemas: list[str]) -> None:
     with st.sidebar:
         st.header("Options")
@@ -582,50 +846,71 @@ def render_tables_tab(schema: dict, schemas: list[str]) -> None:
             )
             path_submitted = st.form_submit_button("Найти путь")
         if path_submitted:
-            fa, err_a = resolve_single_table(path_from.strip(), schema, schema_filter)
-            fb, err_b = resolve_single_table(path_to.strip(), schema, schema_filter)
-            if err_a:
-                st.warning(f"«От»: {err_a}")
-            elif err_b:
-                st.warning(f"«К»: {err_b}")
-            elif fa is not None and fb is not None:
-                path = shortest_fk_path(fa, fb, schema)
-                if not path:
-                    st.warning(f"Путь между `{fa}` и `{fb}` не найден.")
-                else:
-                    st.success(" → ".join(path))
-                    hints = join_hints_along_path(path, schema)
-                    if hints.strip():
-                        st.code(hints, language="sql")
-                    mini = _build_mermaid(path, {path[0]}, schema)
-                    _render_mermaid(mini, len(path))
+            if allow_search(SEARCH_ACTION_FK_PATH):
+                record_search(SEARCH_ACTION_FK_PATH)
+                fa, err_a = resolve_single_table(path_from.strip(), schema, schema_filter)
+                fb, err_b = resolve_single_table(path_to.strip(), schema, schema_filter)
+                if err_a:
+                    st.warning(f"«От»: {err_a}")
+                elif err_b:
+                    st.warning(f"«К»: {err_b}")
+                elif fa is not None and fb is not None:
+                    path = shortest_fk_path(fa, fb, schema)
+                    if not path:
+                        st.warning(f"Путь между `{fa}` и `{fb}` не найден.")
+                    else:
+                        st.success(" → ".join(path))
+                        hints = join_hints_along_path(path, schema)
+                        if hints.strip():
+                            st.code(hints, language="sql")
+                        mini = _build_mermaid(path, {path[0]}, schema)
+                        _render_mermaid(mini, len(path))
+                _show_last_search(SEARCH_ACTION_FK_PATH)
 
     with st.form("search_form"):
         query = st.text_input("Table name or query", "")
         submitted = st.form_submit_button("Search")
 
-    if not submitted:
+    if submitted:
+        if not allow_search(SEARCH_ACTION_TABLES):
+            submitted = False
+        else:
+            record_search(SEARCH_ACTION_TABLES)
+            q = query.strip()
+            if not q:
+                st.warning("Enter a query.")
+                st.session_state.pop("tables_search_payload", None)
+            else:
+                found_direct = (
+                    search(q, schema, schema_filter)
+                    if fuzzy
+                    else search_exact_table(q, schema, schema_filter)
+                )
+                if not found_direct:
+                    st.warning("Nothing found.")
+                    st.session_state.pop("tables_search_payload", None)
+                else:
+                    via_map = (
+                        expand_fk(found_direct, schema, depth=int(depth))
+                        if fk
+                        else {t: set() for t in found_direct}
+                    )
+                    st.session_state["tables_search_payload"] = {
+                        "query": q,
+                        "found_direct": found_direct,
+                        "via_map": via_map,
+                    }
+
+    payload = st.session_state.get("tables_search_payload")
+    if not payload:
         return
 
-    q = query.strip()
-    if not q:
-        st.warning("Enter a query.")
-        return
-
-    found_direct = (
-        search(q, schema, schema_filter) if fuzzy else search_exact_table(q, schema, schema_filter)
-    )
-    if not found_direct:
-        st.warning("Nothing found.")
-        return
-
-    via_map = (
-        expand_fk(found_direct, schema, depth=int(depth))
-        if fk
-        else {t: set() for t in found_direct}
-    )
+    found_direct = payload["found_direct"]
+    via_map = payload["via_map"]
     all_tables = set(via_map.keys())
     sorted_tables = sorted(all_tables, key=lambda t: (t not in found_direct, t))
+
+    _show_last_search(SEARCH_ACTION_TABLES)
 
     st.caption(
         f"Tables: {len(all_tables)} · Direct: {len(found_direct)} · Via FK: {len(all_tables) - len(found_direct)}"
@@ -659,26 +944,30 @@ def render_tables_tab(schema: dict, schemas: list[str]) -> None:
 def render_functions_tab() -> None:
     with st.form("functions_search_form"):
         query_input = st.text_input(
-            "",
-            value=st.session_state.get("functions_query", ""),
+            "Функция",
+            key="functions_query_input",
             placeholder=f"Function name or code fragment (min {MIN_QUERY_LEN} chars)",
+            label_visibility="collapsed",
         )
         submitted = st.form_submit_button("Search", use_container_width=True)
 
     if submitted:
-        clean_query = query_input.strip()
+        clean_query = st.session_state.get("functions_query_input", "").strip()
         st.session_state["functions_query"] = clean_query
         st.session_state["functions_error"] = ""
 
-        if len(clean_query) < MIN_QUERY_LEN:
+        if not allow_search(SEARCH_ACTION_FUNCTIONS):
+            pass
+        elif len(clean_query) < MIN_QUERY_LEN:
             st.session_state["functions_results"] = []
             st.session_state["functions_error"] = (
                 f"Enter at least {MIN_QUERY_LEN} characters."
             )
         else:
+            nonce = record_search(SEARCH_ACTION_FUNCTIONS)
             with st.spinner("Searching..."):
                 try:
-                    records = cached_fetch_functions(clean_query, DEFAULT_LIMIT)
+                    records = cached_fetch_functions(clean_query, DEFAULT_LIMIT, nonce)
                     st.session_state["functions_results"] = records
                 except Exception as exc:
                     st.session_state["functions_results"] = []
@@ -712,19 +1001,15 @@ def render_functions_tab() -> None:
             st.caption("No functions found.")
         return
 
+    _show_last_search(SEARCH_ACTION_FUNCTIONS)
     n = len(records)
     suffix = f" · showing first {DEFAULT_LIMIT}" if n >= DEFAULT_LIMIT else ""
     st.caption(f"{n} function{'s' if n != 1 else ''} found{suffix}")
-    st.divider()
 
-    for record in records:
-        col_name, col_meta, col_btn = st.columns([5, 3, 1])
-        col_name.markdown(f"**{record.function_name}**")
-        col_meta.caption(
-            f"{record.schema_name}  ·  {record.pg_user or '—'}  ·  {record.rowversion or '—'}"
-        )
-        if col_btn.button("View", key=f"view_{record.version_id}"):
-            show_code_modal(record, current_query)
+    render_function_list_panel(
+        records,
+        key_prefix="functions_tab",
+    )
 
 
 def render_diff_colored(diff_text: str) -> None:
@@ -889,14 +1174,14 @@ def render_function_timeline_tab() -> None:
         with col1:
             function_name = st.text_input(
                 "Название функции",
-                value=st.session_state.get("timeline_function_name", ""),
+                key="timeline_function_name_input",
                 placeholder="Введите точное название функции",
             )
         
         with col2:
             schema_name = st.text_input(
                 "Схема (опционально)",
-                value=st.session_state.get("timeline_schema_name", ""),
+                key="timeline_schema_name_input",
                 placeholder="public",
             )
         
@@ -911,22 +1196,29 @@ def render_function_timeline_tab() -> None:
         submitted = st.form_submit_button("Показать историю", use_container_width=True)
     
     if submitted:
-        clean_name = function_name.strip()
-        clean_schema = schema_name.strip() if schema_name.strip() else None
+        clean_name = st.session_state.get("timeline_function_name_input", "").strip()
+        raw_schema = st.session_state.get("timeline_schema_name_input", "")
+        clean_schema = raw_schema.strip() if raw_schema.strip() else None
         db_filter = source_db_filter if source_db_filter != "all" else None
         
         st.session_state["timeline_function_name"] = clean_name
         st.session_state["timeline_schema_name"] = clean_schema or ""
         st.session_state["timeline_db_filter"] = db_filter
-        st.session_state["timeline_error"] = ""
-        st.session_state["timeline_results"] = []
-        
+
         if not clean_name:
             st.session_state["timeline_error"] = "Введите название функции."
+            st.session_state["timeline_results"] = []
+        elif not allow_search(SEARCH_ACTION_TIMELINE):
+            pass
         else:
+            st.session_state["timeline_error"] = ""
+            st.session_state["timeline_results"] = []
+            nonce = record_search(SEARCH_ACTION_TIMELINE)
             with st.spinner("Загрузка истории..."):
                 try:
-                    versions = cached_fetch_timeline(clean_name, clean_schema, db_filter)
+                    versions = cached_fetch_timeline(
+                        clean_name, clean_schema, db_filter, nonce
+                    )
                     st.session_state["timeline_results"] = versions
                     if not versions:
                         st.session_state["timeline_error"] = f"Функция '{clean_name}' не найдена."
@@ -948,6 +1240,7 @@ def render_function_timeline_tab() -> None:
         return
     
     st.success(f"Найдено версий: {len(versions)}")
+    _show_last_search(SEARCH_ACTION_TIMELINE)
     
     # Предупреждение при поиске по всем базам
     if not st.session_state.get("timeline_db_filter"):
@@ -1106,20 +1399,24 @@ def render_function_tables_tab(schema: dict) -> None:
     with st.form("function_tables_form"):
         function_name = st.text_input(
             "Название функции",
-            value=st.session_state.get("function_tables_query", ""),
+            key="function_tables_query_input",
             placeholder="Введите точное название функции",
         )
         submitted = st.form_submit_button("Найти таблицы", use_container_width=True)
 
     if submitted:
-        clean_name = function_name.strip()
+        clean_name = st.session_state.get("function_tables_query_input", "").strip()
         st.session_state["function_tables_query"] = clean_name
-        st.session_state["function_tables_error"] = ""
-        st.session_state["function_tables_results"] = []
 
         if not clean_name:
             st.session_state["function_tables_error"] = "Введите название функции."
+            st.session_state["function_tables_results"] = []
+        elif not allow_search(SEARCH_ACTION_FUNCTION_TABLES):
+            pass
         else:
+            st.session_state["function_tables_error"] = ""
+            st.session_state["function_tables_results"] = []
+            record_search(SEARCH_ACTION_FUNCTION_TABLES)
             with st.spinner("Поиск таблиц в функции..."):
                 try:
                     tables = extract_tables_from_function(clean_name)
@@ -1146,6 +1443,7 @@ def render_function_tables_tab(schema: dict) -> None:
         return
 
     st.success(f"Найдено таблиц: {len(tables)}")
+    _show_last_search(SEARCH_ACTION_FUNCTION_TABLES)
     
     # Собираем все структуры таблиц в один текст для копирования
     all_structures = []
@@ -1174,14 +1472,254 @@ def render_function_tables_tab(schema: dict) -> None:
     st.code(result_text, language=None)
 
 
+def render_migration_export_tab() -> None:
+    """Экспорт DDL из version_tab за период с фильтром по pg_user."""
+    active = get_active_profile()
+    prod = get_prod_profile()
+    st.caption(
+        "Выгрузка функций из `version_tab` за выбранный период. "
+        "Источник — активное подключение в sidebar; при заданном PROD показывается сравнение."
+    )
+    col_src, col_prod = st.columns(2)
+    with col_src:
+        if active:
+            st.info(f"**Источник:** {active.name} (`{active.host}/{active.dbname}`)")
+        else:
+            st.info("**Источник:** не задан")
+    with col_prod:
+        if prod:
+            st.warning(
+                f"**PROD:** {prod.name} (`{prod.host}/{prod.dbname}`)"
+            )
+        else:
+            st.warning("**PROD:** не задан — задайте в sidebar для сравнения")
+
+    today = date.today()
+    default_from = st.session_state.get("migration_date_from", today)
+    default_to = st.session_state.get("migration_date_to", today)
+
+    preset_col1, preset_col2, preset_col3, preset_col4 = st.columns(4)
+    if preset_col1.button("Сегодня", key="migration_preset_today", use_container_width=True):
+        st.session_state["migration_date_from"] = today
+        st.session_state["migration_date_to"] = today
+        st.rerun()
+    if preset_col2.button("Вчера", key="migration_preset_yesterday", use_container_width=True):
+        yesterday = today - timedelta(days=1)
+        st.session_state["migration_date_from"] = yesterday
+        st.session_state["migration_date_to"] = yesterday
+        st.rerun()
+    if preset_col3.button("7 дней", key="migration_preset_week", use_container_width=True):
+        st.session_state["migration_date_from"] = today - timedelta(days=6)
+        st.session_state["migration_date_to"] = today
+        st.rerun()
+    if preset_col4.button("30 дней", key="migration_preset_month", use_container_width=True):
+        st.session_state["migration_date_from"] = today - timedelta(days=29)
+        st.session_state["migration_date_to"] = today
+        st.rerun()
+
+    default_from = st.session_state.get("migration_date_from", today)
+    default_to = st.session_state.get("migration_date_to", today)
+
+    try:
+        pg_users = cached_fetch_pg_users(0)
+    except Exception as exc:
+        st.error(f"Не удалось загрузить список пользователей: {exc}")
+        pg_users = []
+
+    user_options = ["(любой)"] + pg_users
+    saved_user = st.session_state.get("migration_pg_user", "(любой)")
+    if saved_user not in user_options:
+        saved_user = "(любой)"
+
+    with st.form("migration_export_form"):
+        col_from, col_to, col_schema = st.columns(3)
+        with col_from:
+            date_from = st.date_input("Дата с", value=default_from)
+        with col_to:
+            date_to = st.date_input("Дата по (включительно)", value=default_to)
+        with col_schema:
+            schema_filter = st.text_input(
+                "Схема (опционально)",
+                key="migration_schema_input",
+                placeholder="rem_logic",
+            )
+
+        col_user, col_mode = st.columns(2)
+        with col_user:
+            pg_user_label = st.selectbox(
+                "Пользователь (pg_user)",
+                user_options,
+                index=user_options.index(saved_user),
+            )
+        with col_mode:
+            mode_label = st.selectbox(
+                "Режим",
+                [
+                    "Последняя версия каждой функции за период",
+                    "Все версии за период",
+                ],
+                index=st.session_state.get("migration_mode_index", 0),
+            )
+
+        opt_col1, opt_col2 = st.columns(2)
+        with opt_col1:
+            include_headers = st.checkbox(
+                "Комментарии перед функциями",
+                value=st.session_state.get("migration_include_headers", True),
+            )
+        with opt_col2:
+            export_only_diff = st.checkbox(
+                "Предвыбор: только новые и ≠ PROD",
+                value=st.session_state.get("migration_export_only_diff", True),
+                disabled=prod is None,
+            )
+        submitted = st.form_submit_button("🔍 Найти", use_container_width=True, type="primary")
+
+    if submitted:
+        st.session_state["migration_date_from"] = date_from
+        st.session_state["migration_date_to"] = date_to
+        st.session_state["migration_schema"] = st.session_state.get("migration_schema_input", "").strip()
+        st.session_state["migration_pg_user"] = pg_user_label
+        st.session_state["migration_mode_index"] = 0 if "Последняя" in mode_label else 1
+        st.session_state["migration_include_headers"] = include_headers
+        st.session_state["migration_export_only_diff"] = export_only_diff
+
+        if date_to < date_from:
+            st.session_state["migration_results"] = []
+            st.session_state["migration_compare"] = []
+            st.session_state["migration_error"] = "Дата «по» не может быть раньше даты «с»."
+        elif not allow_search(SEARCH_ACTION_MIGRATION):
+            pass
+        else:
+            st.session_state["migration_error"] = ""
+            st.session_state["migration_compare"] = []
+            pg_user = None if pg_user_label == "(любой)" else pg_user_label
+            schema_name = st.session_state.get("migration_schema_input", "").strip() or None
+            mode = "latest_per_function" if "Последняя" in mode_label else "all_versions"
+            nonce = record_search(SEARCH_ACTION_MIGRATION)
+            with st.spinner("Загрузка из version_tab..."):
+                try:
+                    records = cached_fetch_functions_by_period(
+                        date_from,
+                        date_to,
+                        pg_user,
+                        schema_name,
+                        mode,
+                        DEFAULT_LIMIT,
+                        nonce,
+                    )
+                    st.session_state["migration_results"] = records
+                    st.session_state["migration_export_options"] = PeriodExportOptions(
+                        date_from=date_from,
+                        date_to=date_to,
+                        pg_user=pg_user,
+                        schema_name=schema_name,
+                        mode=mode,
+                        limit=DEFAULT_LIMIT,
+                    )
+                    if prod and records:
+                        st.session_state["migration_compare"] = compare_functions_with_prod(
+                            records, prod
+                        )
+                    if prod and records and export_only_diff:
+                        compare = st.session_state.get("migration_compare", [])
+                        st.session_state["migration_tab_export_pick"] = [
+                            item.dev.qualified_name
+                            for item in filter_compare_results(compare, only_changed=True)
+                        ]
+                    else:
+                        st.session_state["migration_tab_export_pick"] = [
+                            r.qualified_name for r in records
+                        ]
+                    if "migration_tab_grid" in st.session_state:
+                        del st.session_state["migration_tab_grid"]
+                except Exception as exc:
+                    st.session_state["migration_results"] = []
+                    st.session_state["migration_error"] = str(exc)
+
+    error_message = st.session_state.get("migration_error", "")
+    if error_message:
+        st.warning(error_message)
+        return
+
+    export_options: PeriodExportOptions | None = st.session_state.get("migration_export_options")
+    if export_options:
+        with st.expander("SQL query", expanded=False):
+            st.code(functions_period_sql_preview(export_options), language="sql")
+
+    records: list[FunctionRecord] = st.session_state.get("migration_results", [])
+    if "migration_results" not in st.session_state:
+        return
+
+    if not records:
+        if export_options:
+            st.caption("За выбранный период ничего не найдено.")
+        return
+
+    compare_results: list[FunctionCompareResult] = st.session_state.get("migration_compare", [])
+    include_headers = st.session_state.get("migration_include_headers", True)
+
+    n = len(records)
+    suffix = f" · показаны первые {DEFAULT_LIMIT}" if n >= DEFAULT_LIMIT else ""
+    st.caption(f"Найдено: {n}{suffix}")
+    _show_last_search(SEARCH_ACTION_MIGRATION)
+
+    selected_records = render_function_list_panel(
+        records,
+        compare_results=compare_results or None,
+        key_prefix="migration_tab",
+        selectable=True,
+    )
+
+    st.divider()
+
+    if not selected_records:
+        st.subheader("Скрипт для наката")
+        st.warning("Отметьте хотя бы одну функцию (колонка ✓ в таблице).")
+        return
+
+    script = build_migration_script(selected_records, include_headers=include_headers)
+
+    head_col, dl_col = st.columns([3, 1])
+    with head_col:
+        st.subheader("Скрипт для наката")
+        st.caption(f"{len(selected_records)} функций · {len(script):,} символов")
+    with dl_col:
+        filename_parts = (
+            [export_options.date_from.isoformat(), export_options.date_to.isoformat()]
+            if export_options
+            else ["export"]
+        )
+        if export_options and export_options.schema_name:
+            filename_parts.append(export_options.schema_name)
+        if export_options and export_options.pg_user:
+            filename_parts.append(export_options.pg_user.replace(" ", "_").replace(";", ""))
+        download_name = f"functions_{'_'.join(filename_parts)}.sql"
+
+        st.download_button(
+            f"⬇ Скачать ({len(selected_records)})",
+            data=script,
+            file_name=download_name,
+            mime="text/sql",
+            use_container_width=True,
+            type="primary",
+        )
+
+    with st.expander("Показать SQL-скрипт", expanded=False):
+        st.code(script, language="sql")
+
+
 def main() -> None:
     st.set_page_config(page_title="Tables explorer", layout="wide")
+    init_db()
+    import_from_env_if_empty()
+    render_db_settings_sidebar()
     st.title("Tables explorer")
 
     schema = cached_schema()
     schemas = _schema_names(schema)
-    tables_tab, functions_tab, function_tables_tab, timeline_tab = st.tabs(
-        ["Tables", "Функции", "Таблицы из функции", "Timeline функций"]
+    tables_tab, functions_tab, function_tables_tab, timeline_tab, migration_tab = st.tabs(
+        ["Tables", "Функции", "Таблицы из функции", "Timeline функций", "Экспорт DDL"]
     )
 
     with tables_tab:
@@ -1195,6 +1733,9 @@ def main() -> None:
     
     with timeline_tab:
         render_function_timeline_tab()
+
+    with migration_tab:
+        render_migration_export_tab()
 
 
 if __name__ == "__main__":
